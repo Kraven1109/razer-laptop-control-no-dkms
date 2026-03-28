@@ -18,8 +18,9 @@ Linux daemon and GUI for controlling Razer Blade laptops via HID (no kernel driv
 - **Keyboard brightness** — 0-100% with live readout
 - **Logo LED control** — Off, On, Breathing
 - **Battery Health Optimizer** — Charge threshold control (50-80%)
-- **NVIDIA GPU monitoring** — Real-time polling: temperature, utilization, VRAM, power, clocks
-- **Performance timeline chart** — Live 60-second rolling chart of GPU temp, usage, and power draw
+- **NVIDIA GPU monitoring** — Real-time polling: temperature, utilization, VRAM, power draw, TGP limit, clocks
+- **Performance timeline chart** — Live 60s rolling chart: GPU temp / usage / power draw with wattage Y-axis and TGP reference line
+- **Smart animation throttle** — Keyboard RGB automatically slows to 3 FPS under heavy GPU load (≥70%), reducing EC interrupt contention with NVIDIA Dynamic Boost
 - **System tray quick actions** — Power modes, lighting effects, open settings
 - **Settings persistence** — All settings saved to disk and restored on daemon restart
 - **Cross-DE support** — KDE Plasma + Wayland, GNOME (with AppIndicator extension for tray)
@@ -77,7 +78,7 @@ razer-cli write logo ac 1
 razer-cli write bho on 75
 razer-cli read bho
 
-# NVIDIA GPU status
+# NVIDIA GPU status (shows current draw + TGP default limit)
 razer-cli gpu
 
 # Hardware effects (run on keyboard controller)
@@ -114,7 +115,7 @@ Launch from application menu or:
 razer-settings
 ```
 
-Pages: AC settings (+ CPU power limits), Battery settings, Keyboard (backlight effects + BHO), About (device info + live GPU stats + performance timeline).
+Pages: AC settings (+ CPU power limits), Battery settings, Keyboard (backlight effects + BHO), About (device info + live GPU stats with TGP limit + performance timeline with watt Y-axis).
 
 The keyboard backlight section shows dynamic controls based on the selected effect:
 per-effect speed, direction, density, and duration sliders, plus primary/secondary color pickers.
@@ -134,10 +135,32 @@ and standard effects.
 razer-cli  ──┐
 razer-settings ──┤──► Unix Socket ──► daemon ──► HID (hidapi) ──► Keyboard
 system tray  ──┘                        │
-                                        ├──► nvidia-smi ──► GPU stats
+                                        ├──► nvidia-smi ──► GPU stats + TGP limit
+                                        ├──► GPU load monitor ──► adaptive animation FPS
                                         ├──► D-Bus (UPower) ──► Battery/AC
                                         └──► D-Bus (ScreenSaver) ──► Idle detection
 ```
+
+## Display Flickering on Built-in Panel (PRIME/Optimus)
+
+On Razer Blade 16 2023 with KDE Plasma + Wayland, the built-in display may flicker during
+heavy GPU workloads. External monitors are unaffected (they connect directly to the NVIDIA GPU).
+
+**Root cause:** NVIDIA Dynamic Boost 2.0 renegotiates the GPU TGP under load via the
+`\_SB_.NPCF` ACPI interface (between NVIDIA GSP firmware and Razer EC). Each TGP change
+causes a brief GPU clock/voltage transition that stalls frame delivery through the PRIME
+DMA path to the Intel display engine.
+
+**Important:** `nvidia-smi -pl` does **not** work on this hardware (EC-controlled, NVML
+power capping refused). PSR is NOT enabled (panel does not support it).
+
+**Daemon mitigation:** Keyboard RGB slows to 3 FPS when GPU ≥ 70%, reducing EC USB
+interrupt load during peak Dynamic Boost activity.
+
+**Other mitigations:**
+- Set power mode to Gaming during demanding workloads (higher base TGP, smaller Dynamic Boost delta)
+- Use an external display for the most demanding tasks
+- Track `nvidia-utils` updates — this is a known PRIME sync regression that has been fixed in some driver versions
 
 ## Migration Notes
 

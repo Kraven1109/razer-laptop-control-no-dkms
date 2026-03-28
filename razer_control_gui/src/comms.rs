@@ -61,6 +61,7 @@ pub enum DaemonResponse {
         gpu_util: u8,
         mem_util: u8,
         power_w: f32,
+        power_limit_w: f32,
         mem_used_mb: u32,
         mem_total_mb: u32,
         clock_gpu_mhz: u32,

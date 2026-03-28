@@ -179,7 +179,10 @@ The **Wheel software effect** (rotating color sweep) is implemented in the daemo
 ### New Software Effect
 - **File:** `src/daemon/kbd/effects.rs` — `Wheel` struct
 - **Parameters:** `[speed 1-10, direction 0=CW/1=CCW]`
-- **Behavior:** Maps each key to an angle from keyboard center (row=2.5, col=7.0), computes HSV hue from angle + rotating offset. Saturation varies with distance from center (0.3-1.0). Color wheel rotates by `speed × 2°` per tick.
+- **Behavior:** Maps each key's angle from the **N key** (row 4, col 6 on the 6×15 matrix)
+  to an HSV hue. Formula: `hue = angle + offset` (pure rotation, no radial spiral term
+  that would mask spinning). `offset` advances by `speed × 2°` per 100ms tick.
+  Radial brightness fade (`0.6 + 0.4 * dist/6.0`) adds depth without masking rotation.
 - Registered in daemon.rs, mod.rs, cli.rs, and GUI effect dropdown (index 9)
 
 ---
@@ -189,8 +192,11 @@ The **Wheel software effect** (rotating color sweep) is implemented in the daemo
 ### About Page Enhancement
 - New `adw::PreferencesGroup` "Performance Timeline" with Cairo `DrawingArea`
 - 60-second rolling window (20 samples at 3-second intervals)
-- Three overlaid line charts: Temperature (orange, 0-100°C), GPU Usage (green, 0-100%), Power Draw (cyan, 0-200W scaled)
-- Color-coded legend, gridlines, dual Y-axis labels
+- Three overlaid lines: Temperature (orange, 0-100°C), GPU Usage (green, 0-100%), Power Draw (cyan, 0-200W)
+- **Dual right Y-axis:** GPU% (green) and Watts (cyan, labelled 0W/50W/100W/150W/200W)
+- **TGP reference line:** dashed cyan horizontal line for `power.default_limit` (hardware TGP)
+- **TGP Limit** row added to GPU info group above chart
+- `power_limit_w: f32` added to `GpuStatus`, `comms::DaemonResponse::GetGpuStatus`, CLI output
 
 ---
 
@@ -227,30 +233,78 @@ razer-cli set-pdl 120 160   # Set PL1=120W, PL2=160W
 
 ---
 
-## 14. File Inventory (Post-GTK4 Migration)
+---
+
+## 15. Smart Keyboard Animation Throttle
+
+### GPU Load-Adaptive Animation Rate
+- **Files:** `src/daemon/daemon.rs`, `src/daemon/kbd/mod.rs`
+- `ANIM_SLEEP_MS: AtomicU64` replaces the previous const-based sleep in the animator loop
+- `start_gpu_load_monitor_task()` polls GPU util every 5s via `gpu::query_nvidia_gpu()`:
+  - util ≥ 70% → 333ms sleep (3 FPS)
+  - util ≤ 20% → 100ms sleep (10 FPS, restored)
+  - 20-70% → no change
+
+### PRIME Display Flickering — Root Cause Investigation
+**Symptom:** Built-in OLED flickers during heavy GPU load. External monitors unaffected.
+
+**Analysis:**
+- Display path: NVIDIA renders → PRIME DMA → Intel iGPU → eDP-1 (built-in)
+- External path: NVIDIA → DP/HDMI directly (no flicker)
+- Panel self-refresh: **NOT supported** (confirmed via `/sys/kernel/debug/dri/0000:00:02.0/eDP-1/i915_psr_status`)
+- `nvidia-smi -pl`: **NOT supported** on this hardware (“Changing power management limit not supported in current scope”)
+- NVPCF ACPI path: `\_SB_.NPCF` — Razer EC manages GPU TGP via ACPI WMI, not NVML
+- Mechanism: NVIDIA GSP firmware ↔ Razer EC ↔ power rail = Dynamic Boost 2.0 oscillation
+  under load → brief GPU clock transition → PRIME frame stall → display glitch
+- History: was absent after a Mesa+NVIDIA driver update; regressed since
+  → track `nvidia-utils` changelog for PRIME sync fix
+
+**Daemon contribution:** 10 USB HID keyboard packets/s go to the same Razer EC that
+handles NVPCF. Reducing this to 3/s under peak load lowers EC interrupt pressure.
+
+---
+
+## 16. GPU TGP Lock Attempt
+
+- `pin_nvidia_tgp(watts: u32)` added to `daemon.rs`, called on `SetPowerMode`
+- Calls `nvidia-smi -pm 1 && nvidia-smi -pl <watts>` to enforce NVML SW power cap
+- **Result:** Silently skipped — `nvidia-smi -pl` is refused by driver on this hardware
+- Function kept as no-op for forward compatibility
+
+TGP mapping used (for future reference when NVML support lands):
+| Mode | TGP target |
+|---|---|
+| Silent (0) | 50 W |
+| Balanced (1) | 115 W |
+| Gaming (2) | 150 W |
+| Creator (3) | 115 W |
+
+---
+
+## 17. File Inventory (Current)
 
 ```
 src/
 ├── lib.rs                          # Shared SupportedDevice struct, DEVICE_FILE const
-├── comms.rs                        # IPC protocol (DaemonCommand/DaemonResponse + PDL)
+├── comms.rs                        # IPC protocol (+PDL, +power_limit_w in GetGpuStatus)
 ├── cli/
-│   └── cli.rs                      # razer-cli binary (clap 4, pdl/set-pdl/wheel)
+│   └── cli.rs                      # razer-cli (clap 4, pdl/set-pdl/wheel, TGP in gpu output)
 ├── daemon/
-│   ├── daemon.rs                   # Daemon entry point, IPC handler, RAPL read/write
-│   ├── device.rs                   # HID device communication (RazerPacket)
+│   ├── daemon.rs                   # Entry, IPC, RAPL, ANIM_SLEEP_MS AtomicU64, GPU monitor task
+│   ├── device.rs                   # HID (RazerPacket, set_power_mode, set_brightness)
 │   ├── config.rs                   # JSON config persistence
-│   ├── gpu.rs                      # NVIDIA GPU monitoring
-│   ├── battery.rs                  # UPower D-Bus bindings
+│   ├── gpu.rs                      # nvidia-smi query (+power_limit_w / power.default_limit)
+│   ├── battery.rs                  # UPower D-Bus
 │   ├── screensaver.rs              # FreeDesktop ScreenSaver D-Bus
 │   ├── login1.rs                   # logind D-Bus (sleep/wake)
 │   └── kbd/
-│       ├── mod.rs                  # Effect trait, EffectManager (10 effects)
-│       ├── effects.rs              # 10 software effects (+ Wheel) + hsv_to_rgb
+│       ├── mod.rs                  # Effect trait, EffectManager (10 effects), ANIMATION_SLEEP_MS
+│       ├── effects.rs              # 10 effects; Wheel centered on N key (row 4, col 6)
 │       └── board.rs                # Keyboard matrix (6×15 = 90 keys)
 └── razer-settings/
-    ├── razer-settings.rs           # Relm4/GTK4/Libadwaita GUI (PDL, timeline chart)
+    ├── razer-settings.rs           # Relm4/GTK4/Libadwaita GUI (+TGP row, +W Y-axis, +TGP line)
     ├── tray.rs                     # KDE system tray (ksni, lighting effects submenu)
-    ├── widgets.rs                  # ColorWheel (Cairo DrawingArea, HSV picker)
+    ├── widgets.rs                  # ColorWheel (Cairo HSV picker)
     ├── error_handling.rs           # Panic/crash handling
     ├── style.css                   # Minimal Libadwaita CSS overrides
     └── util.rs                     # AC power check utility

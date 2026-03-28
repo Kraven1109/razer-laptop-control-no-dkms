@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::Mutex;
+use std::sync::{atomic::{AtomicU64, Ordering}, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time;
 
@@ -31,6 +31,11 @@ lazy_static! {
             Err(_) => Mutex::new(device::DeviceManager::new()),
         }
     };
+    /// Dynamic keyboard animation interval (milliseconds).
+    /// Raised under heavy GPU load to reduce EC USB traffic,
+    /// mitigating EC interrupt contention with NVPCF Dynamic Boost
+    /// that causes PRIME pipeline stalls (display flicker).
+    static ref ANIM_SLEEP_MS: AtomicU64 = AtomicU64::new(kbd::ANIMATION_SLEEP_MS);
 }
 
 // Main function for daemon
@@ -85,6 +90,7 @@ fn main() {
     }
 
     start_keyboard_animator_task();
+    start_gpu_load_monitor_task();
     start_screensaver_monitor_task();
     start_battery_monitor_task();
     let clean_thread = start_shutdown_task();
@@ -132,7 +138,32 @@ pub fn start_keyboard_animator_task() -> JoinHandle<()> {
             if let Some(laptop) = DEV_MANAGER.lock().unwrap().get_device() {
                 EFFECT_MANAGER.lock().unwrap().update(laptop);
             }
-            thread::sleep(std::time::Duration::from_millis(kbd::ANIMATION_SLEEP_MS));
+            thread::sleep(std::time::Duration::from_millis(
+                ANIM_SLEEP_MS.load(Ordering::Relaxed)
+            ));
+        }
+    })
+}
+
+/// Monitors GPU utilization and dynamically adjusts keyboard animation rate.
+/// Under heavy GPU load (>70%), animation is slowed to 3 FPS to reduce EC USB
+/// HID traffic, lowering EC interrupt load during NVIDIA NVPCF Dynamic Boost
+/// negotiations. This mitigates PRIME display pipeline stalls that appear as
+/// display flickering on the built-in panel.
+pub fn start_gpu_load_monitor_task() -> JoinHandle<()> {
+    thread::spawn(|| {
+        loop {
+            thread::sleep(std::time::Duration::from_secs(5));
+            if let Some(status) = gpu::query_nvidia_gpu() {
+                let new_sleep = if status.gpu_util >= 70 {
+                    333 // ~3 FPS — reduced EC traffic during heavy GPU load
+                } else if status.gpu_util <= 20 {
+                    kbd::ANIMATION_SLEEP_MS // restore normal 10 FPS when idle
+                } else {
+                    ANIM_SLEEP_MS.load(Ordering::Relaxed) // keep current rate
+                };
+                ANIM_SLEEP_MS.store(new_sleep, Ordering::Relaxed);
+            }
         }
     })
 }
@@ -263,7 +294,19 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
     if let Ok(mut d) = DEV_MANAGER.lock() {
         return match cmd {
             comms::DaemonCommand::SetPowerMode { ac, pwr, cpu, gpu } => {
-                Some(comms::DaemonResponse::SetPowerMode { result: d.set_power_mode(ac, pwr, cpu, gpu) })
+                let ok = d.set_power_mode(ac, pwr, cpu, gpu);
+                // Pin GPU TGP to a stable value matching the power mode, preventing
+                // Dynamic Boost oscillation that causes display flickering.
+                // EC sets hardware TGP; nvidia-smi SW cap provides a stable software ceiling.
+                let tgp: u32 = match pwr {
+                    0 => 50,   // Silent
+                    1 => 115,  // Balanced
+                    2 => 150,  // Gaming
+                    3 => 115,  // Creator
+                    _ => 115,
+                };
+                pin_nvidia_tgp(tgp);
+                Some(comms::DaemonResponse::SetPowerMode { result: ok })
             },
             comms::DaemonCommand::SetFanSpeed { ac, rpm } => {
                 Some(comms::DaemonResponse::SetFanSpeed { result: d.set_fan_rpm(ac, rpm) })
@@ -381,6 +424,7 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                         gpu_util: status.gpu_util,
                         mem_util: status.mem_util,
                         power_w: status.power_w,
+                        power_limit_w: status.power_limit_w,
                         mem_used_mb: status.mem_used_mb,
                         mem_total_mb: status.mem_total_mb,
                         clock_gpu_mhz: status.clock_gpu_mhz,
@@ -428,4 +472,23 @@ fn read_rapl_uw(path: &str) -> u64 {
 
 fn write_rapl_uw(path: &str, value: u64) -> bool {
     std::fs::write(path, value.to_string()).is_ok()
+}
+
+/// Pin the NVIDIA GPU software power cap to a stable wattage.
+/// This prevents Dynamic Boost 2.0 from oscillating the TGP under load,
+/// which on PRIME/Optimus configurations (like Blade 16 2023) causes the
+/// NVIDIA GSP firmware↔EC power negotiation loop to emit rapid TGP changes
+/// that stall the PRIME frame pipeline and appear as display flickering.
+///
+/// Uses persistence mode so the cap survives until next daemon restart.
+/// The cap is re-applied on every power-mode switch.
+fn pin_nvidia_tgp(watts: u32) {
+    // Ensure persistence mode first (required for -pl to persist)
+    let _ = std::process::Command::new("nvidia-smi")
+        .args(["-pm", "1"])
+        .output();
+    let _ = std::process::Command::new("nvidia-smi")
+        .args(["-pl", &watts.to_string()])
+        .output();
+    info!("Pinned GPU TGP to {}W", watts);
 }

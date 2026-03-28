@@ -730,7 +730,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
 
     // GPU section
     if let Some(comms::DaemonResponse::GetGpuStatus {
-        name, temp_c, gpu_util, mem_util, power_w,
+        name, temp_c, gpu_util, mem_util, power_w, power_limit_w,
         mem_used_mb, mem_total_mb, clock_gpu_mhz, clock_mem_mhz,
     }) = send_data(comms::DaemonCommand::GetGpuStatus) {
         let group = adw::PreferencesGroup::builder().title("NVIDIA GPU").build();
@@ -743,6 +743,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
         let usage_label = gtk::Label::builder().label(&format!("{gpu_util}%")).css_classes(["monospace"]).build();
         let vram_label = gtk::Label::builder().label(&format!("{mem_used_mb}/{mem_total_mb} MiB ({mem_util}%)")).css_classes(["monospace"]).build();
         let power_label = gtk::Label::builder().label(&format!("{power_w:.1} W")).css_classes(["monospace"]).build();
+        let tgp_label = gtk::Label::builder().label(&format!("{power_limit_w:.0} W (default)")).css_classes(["monospace"]).build();
         let clock_label = gtk::Label::builder().label(&format!("GPU {clock_gpu_mhz} / Mem {clock_mem_mhz} MHz")).css_classes(["monospace"]).build();
 
         let make_row = |title: &str, suffix: &gtk::Label| {
@@ -755,6 +756,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
         make_row("GPU Usage", &usage_label);
         make_row("VRAM", &vram_label);
         make_row("Power Draw", &power_label);
+        make_row("TGP Limit", &tgp_label);
         make_row("Clocks", &clock_label);
 
         page.add(&group);
@@ -770,6 +772,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
         }
 
         let history: Rc<RefCell<VecDeque<Sample>>> = Rc::new(RefCell::new(VecDeque::with_capacity(CHART_HISTORY + 1)));
+        let tgp_limit: Rc<RefCell<f64>> = Rc::new(RefCell::new(power_limit_w as f64));
         {
             let mut h = history.borrow_mut();
             h.push_back(Sample { temp_c: temp_c as f64, gpu_pct: gpu_util as f64, power_w: power_w as f64 });
@@ -787,6 +790,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
         chart.set_margin_bottom(8);
 
         let hist_draw = history.clone();
+        let tgp_draw = tgp_limit.clone();
         chart.set_draw_func(move |_da, cr, w, h| {
             let w = w as f64;
             let h = h as f64;
@@ -795,7 +799,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
             if n < 2 { return; }
 
             let pad_l = 40.0;
-            let pad_r = 45.0;
+            let pad_r = 72.0; // wider: % + W dual axis
             let pad_t = 10.0;
             let pad_b = 20.0;
             let cw = w - pad_l - pad_r;
@@ -815,16 +819,24 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
                 let _ = cr.stroke();
             }
 
-            // Y-axis labels (left: °C 0-100, right: % 0-100)
-            cr.set_source_rgba(0.6, 0.6, 0.65, 1.0);
+            // Y-axis labels: left = °C (orange), right col1 = GPU% (green), col2 = Watts (cyan)
             cr.set_font_size(9.0);
             for i in 0..=4 {
-                let val = 100 - i * 25;
+                let val = 100 - i * 25;  // 100, 75, 50, 25, 0
+                let watts = val * 2;     // 200, 150, 100, 50, 0
                 let y = pad_t + ch * (i as f64 / 4.0) + 3.0;
-                cr.move_to(4.0, y);
-                let _ = cr.show_text(&format!("{val}°C"));
-                cr.move_to(w - pad_r + 4.0, y);
+                // Temp axis (left, orange)
+                cr.set_source_rgba(1.0, 0.6, 0.2, 0.85);
+                cr.move_to(2.0, y);
+                let _ = cr.show_text(&format!("{val}°"));
+                // GPU% axis (right inner, green)
+                cr.set_source_rgba(0.27, 1.0, 0.63, 0.85);
+                cr.move_to(w - pad_r + 2.0, y);
                 let _ = cr.show_text(&format!("{val}%"));
+                // Watts axis (right outer, cyan)
+                cr.set_source_rgba(0.3, 0.8, 1.0, 0.85);
+                cr.move_to(w - pad_r + 32.0, y);
+                let _ = cr.show_text(&format!("{watts}W"));
             }
 
             let x_step = cw / (CHART_HISTORY.max(2) - 1) as f64;
@@ -854,12 +866,29 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
             draw_line(&|i| hist_ref[i].temp_c, 1.0, 0.6, 0.2, 100.0);
             // GPU % (green)
             draw_line(&|i| hist_ref[i].gpu_pct, 0.27, 1.0, 0.63, 100.0);
-            // Power (cyan, scaled to 200W max)
+            // Power (cyan, scaled 0-200W → 0-100)
             draw_line(&|i| hist_ref[i].power_w * (100.0 / 200.0), 0.3, 0.8, 1.0, 100.0);
+
+            // TGP limit — dashed horizontal reference line
+            let tgp = *tgp_draw.borrow();
+            if tgp > 0.0 {
+                let tgp_y = pad_t + ch * (1.0 - (tgp * (100.0 / 200.0)) / 100.0);
+                cr.set_source_rgba(0.3, 0.8, 1.0, 0.35);
+                cr.set_line_width(1.5);
+                cr.set_dash(&[5.0, 4.0], 0.0);
+                cr.move_to(pad_l, tgp_y);
+                cr.line_to(pad_l + cw, tgp_y);
+                let _ = cr.stroke();
+                cr.set_dash(&[], 0.0);
+                cr.set_font_size(8.0);
+                cr.set_source_rgba(0.3, 0.8, 1.0, 0.7);
+                cr.move_to(pad_l + 2.0, tgp_y - 2.0);
+                let _ = cr.show_text(&format!("TGP {tgp:.0}W"));
+            }
 
             // Legend
             cr.set_font_size(10.0);
-            let legend = [("Temp", 1.0, 0.6, 0.2), ("GPU %", 0.27, 1.0, 0.63), ("Power", 0.3, 0.8, 1.0)];
+            let legend = [("Temp", 1.0_f64, 0.6, 0.2), ("GPU%", 0.27, 1.0, 0.63), ("W draw", 0.3, 0.8, 1.0)];
             let mut lx = pad_l + 4.0;
             for (label, r, g, b) in &legend {
                 cr.set_source_rgb(*r, *g, *b);
@@ -867,7 +896,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
                 let _ = cr.fill();
                 cr.move_to(lx + 11.0, h - 4.5);
                 let _ = cr.show_text(label);
-                lx += 60.0;
+                lx += 58.0;
             }
         });
 
@@ -876,26 +905,30 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
 
         // Poll every 3 seconds — update labels + chart
         let hist_poll = history;
+        let tgp_poll = tgp_limit;
         let chart_ref = chart;
         glib::timeout_add_seconds_local(3, glib::clone!(
             #[weak] temp_label,
             #[weak] usage_label,
             #[weak] vram_label,
             #[weak] power_label,
+            #[weak] tgp_label,
             #[weak] clock_label,
             #[weak] chart_ref,
             #[upgrade_or] glib::ControlFlow::Break,
             move || {
                 if let Some(comms::DaemonResponse::GetGpuStatus {
-                    temp_c, gpu_util, mem_util, power_w,
+                    temp_c, gpu_util, mem_util, power_w, power_limit_w,
                     mem_used_mb, mem_total_mb, clock_gpu_mhz, clock_mem_mhz, ..
                 }) = send_data(comms::DaemonCommand::GetGpuStatus) {
                     temp_label.set_text(&format!("{temp_c}°C"));
                     usage_label.set_text(&format!("{gpu_util}%"));
                     vram_label.set_text(&format!("{mem_used_mb}/{mem_total_mb} MiB ({mem_util}%)"));
                     power_label.set_text(&format!("{power_w:.1} W"));
+                    tgp_label.set_text(&format!("{power_limit_w:.0} W (default)"));
                     clock_label.set_text(&format!("GPU {clock_gpu_mhz} / Mem {clock_mem_mhz} MHz"));
 
+                    *tgp_poll.borrow_mut() = power_limit_w as f64;
                     let mut h = hist_poll.borrow_mut();
                     h.push_back(Sample { temp_c: temp_c as f64, gpu_pct: gpu_util as f64, power_w: power_w as f64 });
                     while h.len() > CHART_HISTORY { h.pop_front(); }
