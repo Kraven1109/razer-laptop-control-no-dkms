@@ -26,7 +26,10 @@ pub enum DaemonCommand {
     GetSync (),
     SetBatteryHealthOptimizer { is_on: bool, threshold: u8 },
     GetBatteryHealthOptimizer (),
-    GetDeviceName 
+    GetDeviceName,
+    GetGpuStatus,
+    GetPowerLimits,
+    SetPowerLimits { pl1_watts: u32, pl2_watts: u32 },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -51,7 +54,24 @@ pub enum DaemonResponse {
     GetSync { sync: bool },
     SetBatteryHealthOptimizer { result: bool },
     GetBatteryHealthOptimizer { is_on: bool, threshold: u8 },
-    GetDeviceName { name: String }
+    GetDeviceName { name: String },
+    GetGpuStatus {
+        name: String,
+        temp_c: i32,
+        gpu_util: u8,
+        mem_util: u8,
+        power_w: f32,
+        mem_used_mb: u32,
+        mem_total_mb: u32,
+        clock_gpu_mhz: u32,
+        clock_mem_mhz: u32,
+    },
+    GetPowerLimits {
+        pl1_watts: u32,
+        pl2_watts: u32,
+        pl1_max_watts: u32,
+    },
+    SetPowerLimits { result: bool },
 }
 
 #[allow(dead_code)]

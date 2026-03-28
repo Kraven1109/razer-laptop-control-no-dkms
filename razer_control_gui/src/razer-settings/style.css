@@ -1,0 +1,29 @@
+/* Razer Blade Control — Libadwaita Overrides */
+
+/* Accent-green highlights for the brand identity */
+.accent-label {
+    color: #44ffa1;
+    font-weight: 600;
+}
+
+/* Color wheel container */
+.color-wheel-frame {
+    padding: 12px;
+}
+
+/* GPU stats monospace values */
+.monospace {
+    font-family: monospace;
+}
+
+/* Effect description */
+.effect-description {
+    font-size: small;
+    font-style: italic;
+    opacity: 0.7;
+}
+
+/* Apply button highlight */
+.suggested-action {
+    /* Already styled by Libadwaita */
+}

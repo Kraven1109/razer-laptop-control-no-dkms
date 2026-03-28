@@ -1,6 +1,3 @@
-/*
-use crate::driver_sysfs;
-*/
 use crate::device;
 use std::cmp::Ordering;
 use std::ops;
@@ -194,23 +191,8 @@ impl KeyboardData {
     pub fn new() -> KeyboardData {
         return KeyboardData {
             rows: [RowData::new(); ROWS],
-            // brightness: 0,
         };
     }
-
-    // #[allow(dead_code)]
-    // pub fn set_brightness(&mut self, val: u8, laptop: device::RazerLaptop) -> bool {
-        // // driver_sysfs::write_brightness(val)
-        // // laptop.set_brightness(val);
-        // return true;
-    // }
-
-    // #[allow(dead_code)]
-    // pub fn get_brightness(&mut self, laptop: device::RazerLaptop) -> u8 {
-        // // self.brightness = driver_sysfs::read_brightness();
-        // // self.brightness = laptop.get_brightness();
-        // self.brightness
-    // }
 
     pub fn update_kbd(&mut self, laptop: &mut device::RazerLaptop) -> bool {
         // driver_sysfs::write_rgb_map(self.get_curr_state())
@@ -227,7 +209,6 @@ impl KeyboardData {
     }
 
     /// Sets a specific key in the keyboard matrix to a colour
-    #[allow(dead_code)]
     pub fn set_key_colour(&mut self, row: usize, col: usize, r: u8, g: u8, b: u8) {
         if row >= ROWS {
             return;
@@ -236,15 +217,6 @@ impl KeyboardData {
             return;
         }
         self.rows[row].set_key_color(col, r, g, b)
-    }
-
-    /// Sets a horizontal row on the keyboard to a colour
-    #[allow(dead_code)]
-    pub fn set_row_colour(&mut self, row: usize, r: u8, g: u8, b: u8) {
-        if row >= ROWS {
-            return;
-        }
-        self.rows[row].set_row_color(r, g, b)
     }
 
     /// Sets a vertical column on the keyboard to a colour

@@ -1,6 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Razer Settings
-Comment=Manage settings from your Razer laptop
+Name=Razer Blade Control
+Comment=Manage keyboard, power, and fan settings for Razer laptops
 Exec=/usr/bin/razer-settings
+Icon=razer-blade-control
 Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=razer;keyboard;fan;power;rgb;

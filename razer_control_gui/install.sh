@@ -45,6 +45,9 @@ install() {
         cp target/release/daemon /usr/share/razercontrol/
         cp data/devices/laptops.json /usr/share/razercontrol/
         cp data/udev/99-hidraw-permissions.rules /etc/udev/rules.d/
+        mkdir -p /usr/share/icons/hicolor/scalable/apps
+        cp data/gui/razer-blade-control.svg /usr/share/icons/hicolor/scalable/apps/
+        gtk-update-icon-cache -f /usr/share/icons/hicolor/ 2>/dev/null || true
         udevadm control --reload-rules
 EOF
 
@@ -86,6 +89,8 @@ uninstall() {
         rm -f /usr/share/razercontrol/daemon
         rm -f /usr/share/razercontrol/laptops.json
         rm -f /etc/udev/rules.d/99-hidraw-permissions.rules
+        rm -f /usr/share/icons/hicolor/scalable/apps/razer-blade-control.svg
+        gtk-update-icon-cache -f /usr/share/icons/hicolor/ 2>/dev/null || true
         udevadm control --reload-rules
 EOF
 

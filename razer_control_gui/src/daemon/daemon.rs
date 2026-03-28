@@ -17,21 +17,14 @@ mod config;
 mod kbd;
 mod device;
 mod battery;
-mod dbus_mutter_displayconfig;
-mod dbus_mutter_idlemonitor;
 mod screensaver;
 mod login1;
+mod gpu;
 
 use crate::kbd::Effect;
 
 lazy_static! {
     static ref EFFECT_MANAGER: Mutex<kbd::EffectManager> = Mutex::new(kbd::EffectManager::new());
-    // static ref CONFIG: Mutex<config::Configuration> = {
-        // match config::Configuration::read_from_config() {
-            // Ok(c) => Mutex::new(c),
-            // Err(_) => Mutex::new(config::Configuration::new()),
-        // }
-    // };
     static ref DEV_MANAGER: Mutex<device::DeviceManager> = {
         match device::DeviceManager::read_laptops_file() {
             Ok(c) => Mutex::new(c),
@@ -66,7 +59,14 @@ fn main() {
         use battery::OrgFreedesktopUPowerDevice;
         if let Ok(online) = proxy_ac.online() {
             info!("AC0 online: {:?}", online);
+            // Restore all saved hardware settings (power, fan, brightness, logo)
             d.set_ac_state(online);
+            let config = d.get_ac_config(online as usize);
+            if let Some(config) = config {
+                if let Some(laptop) = d.get_device() {
+                    laptop.set_config(config);
+                }
+            }
             d.restore_standard_effect();
             if let Ok(json) = config::Configuration::read_effects_file() {
                 EFFECT_MANAGER.lock().unwrap().load_from_save(json);
@@ -141,37 +141,7 @@ fn start_screensaver_monitor_task() -> JoinHandle<()> {
     thread::spawn(move || {
         let dbus_session = Connection::new_session()
             .expect("failed to connect to D-Bus session bus");
-        let  proxy = dbus_session.with_proxy("org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig", time::Duration::from_millis(5000));
-        let _id = proxy.match_signal(|h: dbus_mutter_displayconfig::OrgFreedesktopDBusPropertiesPropertiesChanged, _: &Connection, _: &Message| {
-            let online: Option<&i32> = arg::prop_cast(&h.changed_properties, "PowerSaveMode");
-            if let Some(online) = online {
-                if *online == 3 {
-                    if let Ok(mut d) = DEV_MANAGER.lock() {
-                        d.light_off();
-                    }
-                }
-                else if *online == 0 {
-                    if let Ok(mut d) = DEV_MANAGER.lock() {
-                        d.restore_light();
-                    }
-                }
-
-            } 
-            true
-        });
-        let  proxy_idle = dbus_session.with_proxy("org.gnome.Mutter.IdleMonitor", "/org/gnome/Mutter/IdleMonitor/Core", time::Duration::from_millis(5000));
-        let _id = proxy_idle.match_signal(|h: dbus_mutter_idlemonitor::OrgGnomeMutterIdleMonitorWatchFired, _: &Connection, _: &Message| {
-            if let Ok(mut d) = DEV_MANAGER.lock() {
-                if d.idle_id == h.id {
-                    println!("idle trigger {:?}", h.id);
-                    d.light_off();
-                } else if d.active_id == h.id {
-                    println!("active trigger {:?}", h.id);
-                    d.restore_light();
-                }
-            }
-            true
-        });
+        // Uses org.freedesktop.ScreenSaver which is supported by both KDE Plasma and GNOME
         let proxy = dbus_session.with_proxy("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", time::Duration::from_millis(5000));
         let _id = proxy.match_signal(|h: screensaver::OrgFreedesktopScreenSaverActiveChanged, _: &Connection, _: &Message| {
             println!("ActiveChanged {:?}", h.arg0);
@@ -185,19 +155,9 @@ fn start_screensaver_monitor_task() -> JoinHandle<()> {
             true
         });
 
-        loop { 
-            if let Ok(res) = dbus_session.process(time::Duration::from_millis(1000)) {
-                if res {
-                    if let Ok(mut d) = DEV_MANAGER.lock() {
-                        d.add_active_watch(&proxy_idle);
-                    }
-                }
-                if let Ok(mut d) = DEV_MANAGER.lock() {
-                    d.add_idle_watch(&proxy_idle);
-                }
-            }
+        loop {
+            dbus_session.process(time::Duration::from_millis(1000)).ok();
         }
-
     })
 }
 
@@ -345,6 +305,12 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                         "static_gradient" => Some(kbd::effects::StaticGradient::new(params)),
                         "wave_gradient" => Some(kbd::effects::WaveGradient::new(params)),
                         "breathing_single" => Some(kbd::effects::BreathSingle::new(params)),
+                        "breathing_dual" => Some(kbd::effects::BreathDual::new(params)),
+                        "spectrum_cycle" => Some(kbd::effects::SpectrumCycle::new(params)),
+                        "rainbow_wave" => Some(kbd::effects::RainbowWave::new(params)),
+                        "starlight" => Some(kbd::effects::Starlight::new(params)),
+                        "ripple" => Some(kbd::effects::Ripple::new(params)),
+                        "wheel" => Some(kbd::effects::Wheel::new(params)),
                         _ => None
                     };
 
@@ -407,10 +373,59 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                 return Some(comms::DaemonResponse::GetDeviceName { name });
             }
 
+            comms::DaemonCommand::GetGpuStatus => {
+                if let Some(status) = gpu::query_nvidia_gpu() {
+                    return Some(comms::DaemonResponse::GetGpuStatus {
+                        name: status.name,
+                        temp_c: status.temp_c,
+                        gpu_util: status.gpu_util,
+                        mem_util: status.mem_util,
+                        power_w: status.power_w,
+                        mem_used_mb: status.mem_used_mb,
+                        mem_total_mb: status.mem_total_mb,
+                        clock_gpu_mhz: status.clock_gpu_mhz,
+                        clock_mem_mhz: status.clock_mem_mhz,
+                    });
+                }
+                return None;
+            }
+
+            comms::DaemonCommand::GetPowerLimits => {
+                let pl1 = read_rapl_uw("/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw");
+                let pl2 = read_rapl_uw("/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw");
+                let pl1_max = read_rapl_uw("/sys/class/powercap/intel-rapl:0/constraint_0_max_power_uw");
+                return Some(comms::DaemonResponse::GetPowerLimits {
+                    pl1_watts: (pl1 / 1_000_000) as u32,
+                    pl2_watts: (pl2 / 1_000_000) as u32,
+                    pl1_max_watts: (pl1_max / 1_000_000) as u32,
+                });
+            }
+
+            comms::DaemonCommand::SetPowerLimits { pl1_watts, pl2_watts } => {
+                let ok1 = write_rapl_uw(
+                    "/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw",
+                    pl1_watts as u64 * 1_000_000,
+                );
+                let ok2 = write_rapl_uw(
+                    "/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw",
+                    pl2_watts as u64 * 1_000_000,
+                );
+                return Some(comms::DaemonResponse::SetPowerLimits { result: ok1 && ok2 });
+            }
+
         };
     } else {
         return None;
     }
 }
 
+fn read_rapl_uw(path: &str) -> u64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
 
+fn write_rapl_uw(path: &str, value: u64) -> bool {
+    std::fs::write(path, value.to_string()).is_ok()
+}

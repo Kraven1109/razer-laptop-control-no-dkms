@@ -1,26 +1,27 @@
-use std::io::ErrorKind;
+#![deny(warnings)]
 
-use gtk::prelude::*;
-use gtk::{Application, ApplicationWindow};
-use gtk::{
-    Box, Label, Scale, Stack, StackSwitcher, Switch, ToolItem, Toolbar,
-    ComboBoxText, Button, ColorButton, LinkButton
-};
-use gtk::{glib, glib::clone};
-        
-// sudo apt install libgdk-pixbuf2.0-dev libcairo-dev libatk1.0-dev
-// sudo apt install libpango1.0-dev
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::io::ErrorKind;
+use std::rc::Rc;
+
+use adw::prelude::*;
+use gtk::glib;
+use relm4::prelude::*;
 
 #[path = "../comms.rs"]
 mod comms;
 mod error_handling;
 mod widgets;
 mod util;
+mod tray;
 
 use service::SupportedDevice;
 use error_handling::*;
-use widgets::*;
+use widgets::ColorWheel;
 use util::*;
+
+// ── Daemon communication helpers ──────────────────────────────────────────
 
 fn send_data(opt: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
     match comms::try_bind() {
@@ -29,694 +30,933 @@ fn send_data(opt: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
             crash_with_msg("Can't connect to the daemon");
         }
         Err(error) => {
-            println!("Error opening socket: {error}");
+            eprintln!("Error opening socket: {error}");
             None
         }
     }
 }
 
 fn get_device_name() -> Option<String> {
-    let response = send_data(comms::DaemonCommand::GetDeviceName)?;
-
-    use comms::DaemonResponse::*;
-    match response {
-        GetDeviceName { name } => {
-            Some(name)
-        }
-        response => {
-            // This should not happen
-            println!("Instead of GetDeviceName got {response:?}");
-            None
-        }
+    match send_data(comms::DaemonCommand::GetDeviceName)? {
+        comms::DaemonResponse::GetDeviceName { name } => Some(name),
+        r => { eprintln!("Unexpected: {r:?}"); None }
     }
 }
 
 fn get_bho() -> Option<(bool, u8)> {
-    let response = send_data(comms::DaemonCommand::GetBatteryHealthOptimizer())?;
-
-    use comms::DaemonResponse::*;
-    match response {
-        GetBatteryHealthOptimizer { is_on, threshold } => {
-            Some((is_on, threshold))
-        }
-        response => {
-            // This should not happen
-            println!("Instead of GetBatteryHealthOptimizer got {response:?}");
-            None
-        }
+    match send_data(comms::DaemonCommand::GetBatteryHealthOptimizer())? {
+        comms::DaemonResponse::GetBatteryHealthOptimizer { is_on, threshold } => Some((is_on, threshold)),
+        r => { eprintln!("Unexpected: {r:?}"); None }
     }
 }
 
 fn set_bho(is_on: bool, threshold: u8) -> Option<bool> {
-    let response = send_data(comms::DaemonCommand::SetBatteryHealthOptimizer {
-        is_on, threshold
-    })?;
-
-    use comms::DaemonResponse::*;
-    match response {
-        SetBatteryHealthOptimizer { result } => {
-            Some(result)
-        }
-        response => {
-            // This should not happen
-            println!("Instead of SetBatteryHealthOptimizer got {response:?}");
-            None
-        }
+    match send_data(comms::DaemonCommand::SetBatteryHealthOptimizer { is_on, threshold })? {
+        comms::DaemonResponse::SetBatteryHealthOptimizer { result } => Some(result),
+        r => { eprintln!("Unexpected: {r:?}"); None }
     }
 }
 
 fn get_brightness(ac: bool) -> Option<u8> {
     let ac = if ac { 1 } else { 0 };
-    let response = send_data(comms::DaemonCommand::GetBrightness{ ac })?;
-
-    use comms::DaemonResponse::*;
-    match response {
-        GetBrightness { result } => {
-            Some(result)
-        }
-        response => {
-            // This should not happen
-            println!("Instead of GetBrightness got {response:?}");
-            None
-        }
+    match send_data(comms::DaemonCommand::GetBrightness { ac })? {
+        comms::DaemonResponse::GetBrightness { result } => Some(result),
+        r => { eprintln!("Unexpected: {r:?}"); None }
     }
 }
 
 fn set_brightness(ac: bool, val: u8) -> Option<bool> {
     let ac = if ac { 1 } else { 0 };
-    let response = send_data(comms::DaemonCommand::SetBrightness { ac, val })?;
-
-    use comms::DaemonResponse::*;
-    match response {
-        SetBrightness { result } => {
-            Some(result)
-        }
-        response => {
-            // This should not happen
-            println!("Instead of SetBrightness got {response:?}");
-            None
-        }
+    match send_data(comms::DaemonCommand::SetBrightness { ac, val })? {
+        comms::DaemonResponse::SetBrightness { result } => Some(result),
+        r => { eprintln!("Unexpected: {r:?}"); None }
     }
 }
 
 fn get_logo(ac: bool) -> Option<u8> {
     let ac = if ac { 1 } else { 0 };
-    let response = send_data(comms::DaemonCommand::GetLogoLedState{ ac })?;
-
-    use comms::DaemonResponse::*;
-    match response {
-        GetLogoLedState { logo_state } => {
-            Some(logo_state)
-        }
-        response => {
-            // This should not happen
-            println!("Instead of GetLogoLedState got {response:?}");
-            None
-        }
+    match send_data(comms::DaemonCommand::GetLogoLedState { ac })? {
+        comms::DaemonResponse::GetLogoLedState { logo_state } => Some(logo_state),
+        r => { eprintln!("Unexpected: {r:?}"); None }
     }
 }
 
 fn set_logo(ac: bool, logo_state: u8) -> Option<bool> {
     let ac = if ac { 1 } else { 0 };
-    let response = send_data(comms::DaemonCommand::SetLogoLedState{ ac , logo_state })?;
-
-    use comms::DaemonResponse::*;
-    match response {
-        SetLogoLedState { result } => {
-            Some(result)
-        }
-        response => {
-            // This should not happen
-            println!("Instead of SetLogoLedState got {response:?}");
-            None
-        }
+    match send_data(comms::DaemonCommand::SetLogoLedState { ac, logo_state })? {
+        comms::DaemonResponse::SetLogoLedState { result } => Some(result),
+        r => { eprintln!("Unexpected: {r:?}"); None }
     }
 }
 
 fn set_effect(name: &str, values: Vec<u8>) -> Option<bool> {
-    let response = send_data(comms::DaemonCommand::SetEffect {
-        name: name.into(), params: values
-    })?;
-
-    use comms::DaemonResponse::*;
-    match response {
-        SetEffect { result } => {
-            Some(result)
-        }
-        response => {
-            // This should not happen
-            println!("Instead of SetEffect got {response:?}");
-            None
-        }
+    match send_data(comms::DaemonCommand::SetEffect { name: name.into(), params: values })? {
+        comms::DaemonResponse::SetEffect { result } => Some(result),
+        r => { eprintln!("Unexpected: {r:?}"); None }
     }
 }
 
 fn get_power(ac: bool) -> Option<(u8, u8, u8)> {
-    let ac = if ac { 1 } else { 0 };
-    let mut result = (0, 0, 0);
-
-    let response = send_data(comms::DaemonCommand::GetPwrLevel{ ac })?;
-    use comms::DaemonResponse::*;
-    match response {
-        GetPwrLevel { pwr } => {
-            result.0 = pwr;
-        }
-        response => {
-            // This should not happen
-            println!("Instead of GetPwrLevel got {response:?}");
-            return None
-        }
-    }
-
-    let response = send_data(comms::DaemonCommand::GetCPUBoost { ac })?;
-    use comms::DaemonResponse::*;
-    match response {
-        GetCPUBoost { cpu } => {
-            result.1 = cpu;
-        }
-        response => {
-            // This should not happen
-            println!("Instead of GetCPUBoost got {response:?}");
-            return None
-        }
-    }
-
-    let response = send_data(comms::DaemonCommand::GetGPUBoost { ac })?;
-    use comms::DaemonResponse::*;
-    match response {
-        GetGPUBoost { gpu } => {
-            result.2 = gpu;
-        }
-        response => {
-            // This should not happen
-            println!("Instead of GetGPUBoost got {response:?}");
-            return None
-        }
-    }
-
-    Some(result)
+    let ac_val = if ac { 1 } else { 0 };
+    let pwr = match send_data(comms::DaemonCommand::GetPwrLevel { ac: ac_val })? {
+        comms::DaemonResponse::GetPwrLevel { pwr } => pwr,
+        r => { eprintln!("Unexpected: {r:?}"); return None }
+    };
+    let cpu = match send_data(comms::DaemonCommand::GetCPUBoost { ac: ac_val })? {
+        comms::DaemonResponse::GetCPUBoost { cpu } => cpu,
+        r => { eprintln!("Unexpected: {r:?}"); return None }
+    };
+    let gpu = match send_data(comms::DaemonCommand::GetGPUBoost { ac: ac_val })? {
+        comms::DaemonResponse::GetGPUBoost { gpu } => gpu,
+        r => { eprintln!("Unexpected: {r:?}"); return None }
+    };
+    Some((pwr, cpu, gpu))
 }
 
 fn set_power(ac: bool, power: (u8, u8, u8)) -> Option<bool> {
     let ac = if ac { 1 } else { 0 };
-    let response = send_data(comms::DaemonCommand::SetPowerMode {
-        ac, pwr: power.0, cpu: power.1, gpu: power.2 }
-    )?;
-
-    use comms::DaemonResponse::*;
-    match response {
-        SetPowerMode { result } => {
-            Some(result)
-        }
-        response => {
-            // This should not happen
-            println!("Instead of SetPowerMode got {response:?}");
-            None
-        }
+    match send_data(comms::DaemonCommand::SetPowerMode { ac, pwr: power.0, cpu: power.1, gpu: power.2 })? {
+        comms::DaemonResponse::SetPowerMode { result } => Some(result),
+        r => { eprintln!("Unexpected: {r:?}"); None }
     }
 }
 
 fn get_fan_speed(ac: bool) -> Option<i32> {
     let ac = if ac { 1 } else { 0 };
-    let response = send_data(comms::DaemonCommand::GetFanSpeed{ ac })?;
-
-    use comms::DaemonResponse::*;
-    match response {
-        GetFanSpeed { rpm } => {
-            Some(rpm)
-        }
-        response => {
-            // This should not happen
-            println!("Instead of GetFanSpeed got {response:?}");
-            None
-        }
+    match send_data(comms::DaemonCommand::GetFanSpeed { ac })? {
+        comms::DaemonResponse::GetFanSpeed { rpm } => Some(rpm),
+        r => { eprintln!("Unexpected: {r:?}"); None }
     }
 }
 
 fn set_fan_speed(ac: bool, value: i32) -> Option<bool> {
     let ac = if ac { 1 } else { 0 };
-    let response = send_data(comms::DaemonCommand::SetFanSpeed{ ac, rpm: value })?;
-
-    use comms::DaemonResponse::*;
-    match response {
-        SetFanSpeed { result } => {
-            Some(result)
-        }
-        response => {
-            // This should not happen
-            println!("Instead of SetFanSpeed got {response:?}");
-            None
-        }
+    match send_data(comms::DaemonCommand::SetFanSpeed { ac, rpm: value })? {
+        comms::DaemonResponse::SetFanSpeed { result } => Some(result),
+        r => { eprintln!("Unexpected: {r:?}"); None }
     }
 }
 
+fn get_power_limits() -> Option<(u32, u32, u32)> {
+    match send_data(comms::DaemonCommand::GetPowerLimits)? {
+        comms::DaemonResponse::GetPowerLimits { pl1_watts, pl2_watts, pl1_max_watts } => {
+            Some((pl1_watts, pl2_watts, pl1_max_watts))
+        }
+        r => { eprintln!("Unexpected: {r:?}"); None }
+    }
+}
+
+fn set_power_limits(pl1: u32, pl2: u32) -> Option<bool> {
+    match send_data(comms::DaemonCommand::SetPowerLimits { pl1_watts: pl1, pl2_watts: pl2 })? {
+        comms::DaemonResponse::SetPowerLimits { result } => Some(result),
+        r => { eprintln!("Unexpected: {r:?}"); None }
+    }
+}
+
+// ── Main Application Model ───────────────────────────────────────────────
+
+struct App {
+    _device: SupportedDevice,
+}
+
+#[derive(Debug)]
+enum AppMsg {}
+
+#[relm4::component]
+impl SimpleComponent for App {
+    type Init = SupportedDevice;
+    type Input = AppMsg;
+    type Output = ();
+
+    view! {
+        adw::ApplicationWindow {
+            set_title: Some("Razer Blade Control"),
+            set_default_width: 780,
+            set_default_height: 650,
+            set_icon_name: Some("razer-blade-control"),
+        }
+    }
+
+    fn init(
+        device: Self::Init,
+        root: Self::Root,
+        _sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        let model = App { _device: device.clone() };
+        let widgets = view_output!();
+
+        // Build the view stack
+        let view_stack = adw::ViewStack::new();
+        view_stack.add_titled_with_icon(
+            &build_power_page(true, &device), Some("ac"), "AC", "thunderbolt-symbolic",
+        );
+        view_stack.add_titled_with_icon(
+            &build_power_page(false, &device), Some("battery"), "Battery", "battery-symbolic",
+        );
+        view_stack.add_titled_with_icon(
+            &build_keyboard_page(), Some("keyboard"), "Keyboard", "input-keyboard-symbolic",
+        );
+        view_stack.add_titled_with_icon(
+            &build_about_page(&device), Some("about"), "About", "help-about-symbolic",
+        );
+
+        let view_switcher = adw::ViewSwitcher::new();
+        view_switcher.set_stack(Some(&view_stack));
+        view_switcher.set_policy(adw::ViewSwitcherPolicy::Wide);
+
+        let header = adw::HeaderBar::new();
+        header.set_title_widget(Some(&view_switcher));
+
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&header);
+        toolbar_view.set_content(Some(&view_stack));
+
+        root.set_content(Some(&toolbar_view));
+
+        // Show battery tab if on battery
+        if let Some(false) = check_if_running_on_ac_power() {
+            view_stack.set_visible_child_name("battery");
+        }
+
+        // Minimize to tray
+        root.connect_close_request(|win| {
+            win.set_visible(false);
+            glib::Propagation::Stop
+        });
+
+        ComponentParts { model, widgets }
+    }
+}
+
+// ── Page builders ─────────────────────────────────────────────────────────
+
+fn build_power_page(ac: bool, device: &SupportedDevice) -> gtk::ScrolledWindow {
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .build();
+
+    let page = adw::PreferencesPage::new();
+
+    // Logo section
+    if device.has_logo() {
+        let group = adw::PreferencesGroup::builder().title("Logo").build();
+        let logo = get_logo(ac).unwrap_or(0).min(2);
+
+        let logo_row = adw::ComboRow::builder()
+            .title("Logo Mode")
+            .subtitle("Control the Razer logo LED")
+            .build();
+        let model = gtk::StringList::new(&["Off", "On", "Breathing"]);
+        logo_row.set_model(Some(&model));
+        logo_row.set_selected(logo as u32);
+
+        logo_row.connect_selected_notify(move |row| {
+            let val = row.selected() as u8;
+            set_logo(ac, val);
+            let readback = get_logo(ac).unwrap_or(0).min(2);
+            row.set_selected(readback as u32);
+        });
+
+        group.add(&logo_row);
+        page.add(&group);
+    }
+
+    // Power section
+    if let Some(power) = get_power(ac) {
+        let group = adw::PreferencesGroup::builder().title("Power").build();
+
+        let power_row = adw::ComboRow::builder()
+            .title("Power Profile")
+            .subtitle("System performance mode")
+            .build();
+        power_row.set_model(Some(&gtk::StringList::new(&["Balanced", "Gaming", "Creator", "Silent", "Custom"])));
+        power_row.set_selected(power.0 as u32);
+
+        let cpu_row = adw::ComboRow::builder()
+            .title("CPU Boost")
+            .subtitle("Processor performance level")
+            .build();
+        let mut cpu_opts = vec!["Low", "Medium", "High"];
+        if device.can_boost() { cpu_opts.push("Boost"); }
+        cpu_row.set_model(Some(&gtk::StringList::new(&cpu_opts)));
+        cpu_row.set_selected(power.1 as u32);
+        cpu_row.set_visible(power.0 == 4);
+
+        let gpu_row = adw::ComboRow::builder()
+            .title("GPU Boost")
+            .subtitle("Graphics performance level")
+            .build();
+        gpu_row.set_model(Some(&gtk::StringList::new(&["Low", "Medium", "High"])));
+        gpu_row.set_selected(power.2 as u32);
+        gpu_row.set_visible(power.0 == 4);
+
+        let cpu_clone = cpu_row.clone();
+        let gpu_clone = gpu_row.clone();
+        power_row.connect_selected_notify(move |row| {
+            let profile = row.selected() as u8;
+            let cpu = cpu_clone.selected() as u8;
+            let gpu = gpu_clone.selected() as u8;
+            set_power(ac, (profile, cpu, gpu));
+            if let Some(p) = get_power(ac) {
+                row.set_selected(p.0 as u32);
+                cpu_clone.set_selected(p.1 as u32);
+                gpu_clone.set_selected(p.2 as u32);
+                cpu_clone.set_visible(p.0 == 4);
+                gpu_clone.set_visible(p.0 == 4);
+            }
+        });
+
+        let power_row_c = power_row.clone();
+        let gpu_row_c = gpu_row.clone();
+        cpu_row.connect_selected_notify(move |row| {
+            let profile = power_row_c.selected() as u8;
+            let cpu = row.selected() as u8;
+            let gpu = gpu_row_c.selected() as u8;
+            set_power(ac, (profile, cpu, gpu));
+            if let Some(p) = get_power(ac) {
+                power_row_c.set_selected(p.0 as u32);
+                row.set_selected(p.1 as u32);
+                gpu_row_c.set_selected(p.2 as u32);
+            }
+        });
+
+        let power_row_c2 = power_row.clone();
+        let cpu_row_c2 = cpu_row.clone();
+        gpu_row.connect_selected_notify(move |row| {
+            let profile = power_row_c2.selected() as u8;
+            let cpu = cpu_row_c2.selected() as u8;
+            let gpu = row.selected() as u8;
+            set_power(ac, (profile, cpu, gpu));
+            if let Some(p) = get_power(ac) {
+                power_row_c2.set_selected(p.0 as u32);
+                cpu_row_c2.set_selected(p.1 as u32);
+                row.set_selected(p.2 as u32);
+            }
+        });
+
+        group.add(&power_row);
+        group.add(&cpu_row);
+        group.add(&gpu_row);
+        page.add(&group);
+    }
+
+    // Fan Speed section
+    {
+        let group = adw::PreferencesGroup::builder().title("Fan Speed").build();
+        let fan_speed = get_fan_speed(ac).unwrap_or(0);
+        let min_fan = *device.fan.get(0).unwrap_or(&3500) as f64;
+        let max_fan = *device.fan.get(1).unwrap_or(&5000) as f64;
+
+        let auto_row = adw::SwitchRow::builder()
+            .title("Auto")
+            .subtitle("Let the firmware manage fan speed")
+            .active(fan_speed == 0)
+            .build();
+
+        let spin_row = adw::SpinRow::with_range(min_fan, max_fan, 100.0);
+        spin_row.set_title("Speed (RPM)");
+        spin_row.set_subtitle("Manual fan speed");
+        spin_row.set_value(if fan_speed == 0 { min_fan } else { fan_speed as f64 });
+        spin_row.set_sensitive(fan_speed != 0);
+
+        let spin_clone = spin_row.clone();
+        auto_row.connect_active_notify(move |row| {
+            let rpm = if row.is_active() { 0 } else { min_fan as i32 };
+            set_fan_speed(ac, rpm);
+            let readback = get_fan_speed(ac).unwrap_or(0);
+            let is_auto = readback == 0;
+            row.set_active(is_auto);
+            spin_clone.set_sensitive(!is_auto);
+            if !is_auto { spin_clone.set_value(readback as f64); }
+        });
+
+        let auto_clone = auto_row.clone();
+        spin_row.connect_value_notify(move |row| {
+            let val = row.value().clamp(min_fan, max_fan) as i32;
+            set_fan_speed(ac, val);
+            let readback = get_fan_speed(ac).unwrap_or(0);
+            let is_auto = readback == 0;
+            auto_clone.set_active(is_auto);
+            row.set_sensitive(!is_auto);
+            if !is_auto { row.set_value(readback as f64); }
+        });
+
+        group.add(&auto_row);
+        group.add(&spin_row);
+        page.add(&group);
+    }
+
+    // Brightness section
+    {
+        let group = adw::PreferencesGroup::builder().title("Keyboard Brightness").build();
+        let brightness = get_brightness(ac).unwrap_or(50);
+
+        let spin_row = adw::SpinRow::with_range(0.0, 100.0, 1.0);
+        spin_row.set_title("Brightness");
+        spin_row.set_subtitle("Keyboard backlight intensity");
+        spin_row.set_value(brightness as f64);
+
+        spin_row.connect_value_notify(move |row| {
+            let val = row.value().clamp(0.0, 100.0) as u8;
+            set_brightness(ac, val);
+            let readback = get_brightness(ac).unwrap_or(val);
+            row.set_value(readback as f64);
+        });
+
+        group.add(&spin_row);
+        page.add(&group);
+    }
+
+    // CPU Power Limits (PDL1/PDL2) — AC page only
+    if ac {
+        if let Some((pl1, pl2, pl1_max)) = get_power_limits() {
+            let tdp_base = if pl1_max > 0 { pl1_max } else { 55 };
+            let max_pl = (tdp_base * 4).max(pl1.max(pl2) + 20); // generous upper bound
+
+            let group = adw::PreferencesGroup::builder()
+                .title("CPU Power Limits (RAPL)")
+                .description("Intel PL1 (sustained) and PL2 (boost) — requires root daemon")
+                .build();
+
+            let pl1_row = adw::SpinRow::with_range(tdp_base as f64, max_pl as f64, 5.0);
+            pl1_row.set_title("PL1 — Sustained (W)");
+            pl1_row.set_subtitle(&format!("Long-term power limit (base TDP: {tdp_base} W)"));
+            pl1_row.set_value(pl1 as f64);
+
+            let pl2_row = adw::SpinRow::with_range(tdp_base as f64, max_pl as f64, 5.0);
+            pl2_row.set_title("PL2 — Boost (W)");
+            pl2_row.set_subtitle("Short-term burst power limit");
+            pl2_row.set_value(pl2 as f64);
+
+            let apply_btn = gtk::Button::builder()
+                .label("Apply Power Limits")
+                .halign(gtk::Align::Center)
+                .css_classes(["suggested-action", "pill"])
+                .build();
+            apply_btn.set_size_request(200, -1);
+
+            let pl1_ref = pl1_row.clone();
+            let pl2_ref = pl2_row.clone();
+            apply_btn.connect_clicked(move |_| {
+                let p1 = pl1_ref.value() as u32;
+                let p2 = pl2_ref.value() as u32;
+                set_power_limits(p1, p2);
+                if let Some((r1, r2, _)) = get_power_limits() {
+                    pl1_ref.set_value(r1 as f64);
+                    pl2_ref.set_value(r2 as f64);
+                }
+            });
+
+            group.add(&pl1_row);
+            group.add(&pl2_row);
+            group.add(&apply_btn);
+            page.add(&group);
+        }
+    }
+
+    scroll.set_child(Some(&page));
+    scroll
+}
+
+fn build_keyboard_page() -> gtk::ScrolledWindow {
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .build();
+
+    let page = adw::PreferencesPage::new();
+
+    // Effect selection
+    let effect_group = adw::PreferencesGroup::builder()
+        .title("Keyboard Backlight")
+        .description("Choose a lighting effect and configure its parameters")
+        .build();
+
+    let effect_names = [
+        "Static", "Static Gradient", "Wave Gradient", "Breathing",
+        "Breathing Dual", "Spectrum Cycle", "Rainbow Wave", "Starlight", "Ripple",
+        "Wheel",
+    ];
+
+    let effect_row = adw::ComboRow::builder()
+        .title("Effect")
+        .subtitle("Keyboard lighting effect")
+        .build();
+    effect_row.set_model(Some(&gtk::StringList::new(&effect_names)));
+    effect_row.set_selected(0);
+
+    let desc_label = gtk::Label::builder()
+        .label("Set a single color across all keys")
+        .halign(gtk::Align::Start)
+        .css_classes(["effect-description"])
+        .build();
+
+    // Color wheels
+    let wheel1 = ColorWheel::new(160);
+    let wheel2 = ColorWheel::new(160);
+    wheel2.set_rgb(0, 128, 255);
+
+    let wheel1_frame = gtk::Frame::builder()
+        .label("Primary Color")
+        .halign(gtk::Align::Center)
+        .css_classes(["color-wheel-frame"])
+        .build();
+    wheel1_frame.set_child(Some(&wheel1.widget));
+
+    let wheel2_frame = gtk::Frame::builder()
+        .label("Secondary Color")
+        .halign(gtk::Align::Center)
+        .css_classes(["color-wheel-frame"])
+        .build();
+    wheel2_frame.set_child(Some(&wheel2.widget));
+
+    let wheels_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(24)
+        .halign(gtk::Align::Center)
+        .margin_top(8)
+        .margin_bottom(8)
+        .build();
+    wheels_box.append(&wheel1_frame);
+    wheels_box.append(&wheel2_frame);
+
+    // Parameter controls
+    let speed_row = adw::SpinRow::with_range(1.0, 10.0, 1.0);
+    speed_row.set_title("Speed");
+    speed_row.set_subtitle("Animation speed");
+    speed_row.set_value(5.0);
+
+    let direction_row = adw::ComboRow::builder()
+        .title("Direction")
+        .subtitle("Wave direction")
+        .build();
+    direction_row.set_model(Some(&gtk::StringList::new(&["Left → Right", "Right → Left"])));
+    direction_row.set_selected(0);
+
+    let density_row = adw::SpinRow::with_range(1.0, 20.0, 1.0);
+    density_row.set_title("Density");
+    density_row.set_subtitle("Star density");
+    density_row.set_value(10.0);
+
+    let duration_row = adw::SpinRow::with_range(1.0, 20.0, 1.0);
+    duration_row.set_title("Duration");
+    duration_row.set_subtitle("Breath cycle length");
+    duration_row.set_value(10.0);
+
+    // Apply button
+    let apply_btn = gtk::Button::builder()
+        .label("Apply Effect")
+        .halign(gtk::Align::Center)
+        .css_classes(["suggested-action", "pill"])
+        .build();
+    apply_btn.set_size_request(200, -1);
+
+    // Dynamic visibility
+    let descriptions = [
+        "Set a single color across all keys",
+        "Smooth gradient between two colors",
+        "Animated wave blending two colors",
+        "Pulsing glow with a single color",
+        "Alternating pulse between two colors",
+        "Cycle through the full color spectrum",
+        "Rainbow wave flowing across the keyboard",
+        "Random twinkling keys with shimmer",
+        "Color ripple from the center outward",
+        "Rotating color wheel around the keyboard center",
+    ];
+
+    let update_visibility = {
+        let wheel1_frame = wheel1_frame.clone();
+        let wheel2_frame = wheel2_frame.clone();
+        let speed_row = speed_row.clone();
+        let direction_row = direction_row.clone();
+        let density_row = density_row.clone();
+        let duration_row = duration_row.clone();
+        let desc_label = desc_label.clone();
+        move |idx: u32| {
+            wheel1_frame.set_visible(matches!(idx, 0 | 1 | 2 | 3 | 4 | 7 | 8));
+            wheel2_frame.set_visible(matches!(idx, 1 | 2 | 4));
+            speed_row.set_visible(matches!(idx, 5 | 6 | 8 | 9));
+            direction_row.set_visible(matches!(idx, 6 | 9));
+            density_row.set_visible(idx == 7);
+            duration_row.set_visible(matches!(idx, 3 | 4));
+            desc_label.set_text(descriptions.get(idx as usize).unwrap_or(&""));
+        }
+    };
+
+    update_visibility(0);
+
+    effect_row.connect_selected_notify({
+        let update = update_visibility.clone();
+        move |row| { update(row.selected()); }
+    });
+
+    // Apply logic
+    let wheel1_ref = wheel1;
+    let wheel2_ref = wheel2;
+    let effect_row_ref = effect_row.clone();
+    let speed_ref = speed_row.clone();
+    let dir_ref = direction_row.clone();
+    let density_ref = density_row.clone();
+    let duration_ref = duration_row.clone();
+
+    apply_btn.connect_clicked(move |_| {
+        let (r1, g1, b1) = wheel1_ref.get_rgb();
+        let (r2, g2, b2) = wheel2_ref.get_rgb();
+        let speed = speed_ref.value() as u8;
+        let dir = dir_ref.selected() as u8;
+        let density = density_ref.value() as u8;
+        let duration = duration_ref.value() as u8;
+
+        match effect_row_ref.selected() {
+            0 => { set_effect("static", vec![r1, g1, b1]); }
+            1 => { set_effect("static_gradient", vec![r1, g1, b1, r2, g2, b2]); }
+            2 => { set_effect("wave_gradient", vec![r1, g1, b1, r2, g2, b2]); }
+            3 => { set_effect("breathing_single", vec![r1, g1, b1, duration]); }
+            4 => { set_effect("breathing_dual", vec![r1, g1, b1, r2, g2, b2, duration]); }
+            5 => { set_effect("spectrum_cycle", vec![speed]); }
+            6 => { set_effect("rainbow_wave", vec![speed, dir]); }
+            7 => { set_effect("starlight", vec![r1, g1, b1, density]); }
+            8 => { set_effect("ripple", vec![r1, g1, b1, speed]); }
+            9 => { set_effect("wheel", vec![speed, dir]); }
+            _ => {}
+        }
+    });
+
+    effect_group.add(&effect_row);
+    effect_group.add(&desc_label);
+    effect_group.add(&wheels_box);
+    effect_group.add(&speed_row);
+    effect_group.add(&direction_row);
+    effect_group.add(&density_row);
+    effect_group.add(&duration_row);
+    effect_group.add(&apply_btn);
+    page.add(&effect_group);
+
+    // BHO section
+    if let Some(bho) = get_bho() {
+        let group = adw::PreferencesGroup::builder()
+            .title("Battery Health Optimizer")
+            .description("Limit charge level to preserve battery longevity")
+            .build();
+
+        let bho_switch = adw::SwitchRow::builder()
+            .title("Enable BHO")
+            .subtitle("Limit maximum charge level")
+            .active(bho.0)
+            .build();
+
+        let threshold_row = adw::SpinRow::with_range(50.0, 80.0, 1.0);
+        threshold_row.set_title("Threshold");
+        threshold_row.set_subtitle("Maximum charge percentage");
+        threshold_row.set_value(bho.1 as f64);
+        threshold_row.set_sensitive(bho.0);
+
+        let thresh_c = threshold_row.clone();
+        bho_switch.connect_active_notify(move |row| {
+            let is_on = row.is_active();
+            let threshold = thresh_c.value().clamp(50.0, 80.0) as u8;
+            set_bho(is_on, threshold);
+            if let Some((on, th)) = get_bho() {
+                row.set_active(on);
+                thresh_c.set_value(th as f64);
+                thresh_c.set_sensitive(on);
+            }
+        });
+
+        let switch_c = bho_switch.clone();
+        threshold_row.connect_value_notify(move |row| {
+            let is_on = switch_c.is_active();
+            let threshold = row.value().clamp(50.0, 80.0) as u8;
+            set_bho(is_on, threshold);
+            if let Some((on, th)) = get_bho() {
+                switch_c.set_active(on);
+                row.set_value(th as f64);
+                row.set_sensitive(on);
+            }
+        });
+
+        group.add(&bho_switch);
+        group.add(&threshold_row);
+        page.add(&group);
+    }
+
+    scroll.set_child(Some(&page));
+    scroll
+}
+
+fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .build();
+
+    let page = adw::PreferencesPage::new();
+
+    // System Information
+    {
+        let group = adw::PreferencesGroup::builder().title("System Information").build();
+
+        let add_info = |title: &str, value: &str| {
+            let row = adw::ActionRow::builder()
+                .title(title)
+                .build();
+            row.add_suffix(&gtk::Label::builder().label(value).css_classes(["monospace"]).build());
+            group.add(&row);
+        };
+
+        add_info("Device", &device.name);
+
+        let dmi_product = std::fs::read_to_string("/sys/devices/virtual/dmi/id/product_name")
+            .unwrap_or_default().trim().to_string();
+        let dmi_vendor = std::fs::read_to_string("/sys/devices/virtual/dmi/id/sys_vendor")
+            .unwrap_or_default().trim().to_string();
+        let dmi_bios = std::fs::read_to_string("/sys/devices/virtual/dmi/id/bios_version")
+            .unwrap_or_default().trim().to_string();
+
+        if !dmi_product.is_empty() {
+            let host = if dmi_vendor.is_empty() { dmi_product } else { format!("{dmi_vendor} {dmi_product}") };
+            add_info("Host", &host);
+        }
+        add_info("USB ID", &format!("{}:{}", device.vid, device.pid));
+        add_info("Features", &device.features.join(", "));
+        if !dmi_bios.is_empty() { add_info("BIOS", &dmi_bios); }
+        add_info("Fan Range", &format!("{} – {} RPM",
+            device.fan.first().unwrap_or(&0), device.fan.get(1).unwrap_or(&0)));
+
+        page.add(&group);
+    }
+
+    // GPU section
+    if let Some(comms::DaemonResponse::GetGpuStatus {
+        name, temp_c, gpu_util, mem_util, power_w,
+        mem_used_mb, mem_total_mb, clock_gpu_mhz, clock_mem_mhz,
+    }) = send_data(comms::DaemonCommand::GetGpuStatus) {
+        let group = adw::PreferencesGroup::builder().title("NVIDIA GPU").build();
+
+        let gpu_row = adw::ActionRow::builder().title("GPU").build();
+        gpu_row.add_suffix(&gtk::Label::builder().label(&name).css_classes(["monospace"]).build());
+        group.add(&gpu_row);
+
+        let temp_label = gtk::Label::builder().label(&format!("{temp_c}°C")).css_classes(["monospace"]).build();
+        let usage_label = gtk::Label::builder().label(&format!("{gpu_util}%")).css_classes(["monospace"]).build();
+        let vram_label = gtk::Label::builder().label(&format!("{mem_used_mb}/{mem_total_mb} MiB ({mem_util}%)")).css_classes(["monospace"]).build();
+        let power_label = gtk::Label::builder().label(&format!("{power_w:.1} W")).css_classes(["monospace"]).build();
+        let clock_label = gtk::Label::builder().label(&format!("GPU {clock_gpu_mhz} / Mem {clock_mem_mhz} MHz")).css_classes(["monospace"]).build();
+
+        let make_row = |title: &str, suffix: &gtk::Label| {
+            let row = adw::ActionRow::builder().title(title).build();
+            row.add_suffix(suffix);
+            group.add(&row);
+        };
+
+        make_row("Temperature", &temp_label);
+        make_row("GPU Usage", &usage_label);
+        make_row("VRAM", &vram_label);
+        make_row("Power Draw", &power_label);
+        make_row("Clocks", &clock_label);
+
+        page.add(&group);
+
+        // ── Timeline chart ────────────────────────────────────────────
+        const CHART_HISTORY: usize = 20; // 20 samples × 3s = 60s window
+
+        #[derive(Clone, Copy, Default)]
+        struct Sample {
+            temp_c: f64,
+            gpu_pct: f64,
+            power_w: f64,
+        }
+
+        let history: Rc<RefCell<VecDeque<Sample>>> = Rc::new(RefCell::new(VecDeque::with_capacity(CHART_HISTORY + 1)));
+        {
+            let mut h = history.borrow_mut();
+            h.push_back(Sample { temp_c: temp_c as f64, gpu_pct: gpu_util as f64, power_w: power_w as f64 });
+        }
+
+        let chart_group = adw::PreferencesGroup::builder()
+            .title("Performance Timeline")
+            .description("Temperature / GPU usage / Power — last 60 s")
+            .build();
+
+        let chart = gtk::DrawingArea::new();
+        chart.set_size_request(-1, 180);
+        chart.set_margin_start(12);
+        chart.set_margin_end(12);
+        chart.set_margin_bottom(8);
+
+        let hist_draw = history.clone();
+        chart.set_draw_func(move |_da, cr, w, h| {
+            let w = w as f64;
+            let h = h as f64;
+            let hist = hist_draw.borrow();
+            let n = hist.len();
+            if n < 2 { return; }
+
+            let pad_l = 40.0;
+            let pad_r = 45.0;
+            let pad_t = 10.0;
+            let pad_b = 20.0;
+            let cw = w - pad_l - pad_r;
+            let ch = h - pad_t - pad_b;
+
+            // Background
+            cr.set_source_rgba(0.12, 0.12, 0.14, 1.0);
+            let _ = cr.paint();
+
+            // Grid lines (5 horizontal)
+            cr.set_source_rgba(0.25, 0.25, 0.28, 1.0);
+            cr.set_line_width(0.5);
+            for i in 0..=4 {
+                let y = pad_t + ch * (i as f64 / 4.0);
+                cr.move_to(pad_l, y);
+                cr.line_to(pad_l + cw, y);
+                let _ = cr.stroke();
+            }
+
+            // Y-axis labels (left: °C 0-100, right: % 0-100)
+            cr.set_source_rgba(0.6, 0.6, 0.65, 1.0);
+            cr.set_font_size(9.0);
+            for i in 0..=4 {
+                let val = 100 - i * 25;
+                let y = pad_t + ch * (i as f64 / 4.0) + 3.0;
+                cr.move_to(4.0, y);
+                let _ = cr.show_text(&format!("{val}°C"));
+                cr.move_to(w - pad_r + 4.0, y);
+                let _ = cr.show_text(&format!("{val}%"));
+            }
+
+            let x_step = cw / (CHART_HISTORY.max(2) - 1) as f64;
+
+            // Draw line helper
+            let draw_line = |data: &dyn Fn(usize) -> f64, r: f64, g: f64, b: f64, max_val: f64| {
+                cr.set_source_rgba(r, g, b, 0.9);
+                cr.set_line_width(2.0);
+                let start_idx = if n > CHART_HISTORY { n - CHART_HISTORY } else { 0 };
+                let points: Vec<(f64, f64)> = (start_idx..n).enumerate().map(|(i, idx)| {
+                    let x = pad_l + i as f64 * x_step;
+                    let val = data(idx).clamp(0.0, max_val);
+                    let y = pad_t + ch * (1.0 - val / max_val);
+                    (x, y)
+                }).collect();
+                if let Some(&(x0, y0)) = points.first() {
+                    cr.move_to(x0, y0);
+                    for &(x, y) in &points[1..] {
+                        cr.line_to(x, y);
+                    }
+                    let _ = cr.stroke();
+                }
+            };
+
+            let hist_ref: &VecDeque<Sample> = &hist;
+            // Temp (orange)
+            draw_line(&|i| hist_ref[i].temp_c, 1.0, 0.6, 0.2, 100.0);
+            // GPU % (green)
+            draw_line(&|i| hist_ref[i].gpu_pct, 0.27, 1.0, 0.63, 100.0);
+            // Power (cyan, scaled to 200W max)
+            draw_line(&|i| hist_ref[i].power_w * (100.0 / 200.0), 0.3, 0.8, 1.0, 100.0);
+
+            // Legend
+            cr.set_font_size(10.0);
+            let legend = [("Temp", 1.0, 0.6, 0.2), ("GPU %", 0.27, 1.0, 0.63), ("Power", 0.3, 0.8, 1.0)];
+            let mut lx = pad_l + 4.0;
+            for (label, r, g, b) in &legend {
+                cr.set_source_rgb(*r, *g, *b);
+                cr.rectangle(lx, h - 12.0, 8.0, 8.0);
+                let _ = cr.fill();
+                cr.move_to(lx + 11.0, h - 4.5);
+                let _ = cr.show_text(label);
+                lx += 60.0;
+            }
+        });
+
+        chart_group.add(&chart);
+        page.add(&chart_group);
+
+        // Poll every 3 seconds — update labels + chart
+        let hist_poll = history;
+        let chart_ref = chart;
+        glib::timeout_add_seconds_local(3, glib::clone!(
+            #[weak] temp_label,
+            #[weak] usage_label,
+            #[weak] vram_label,
+            #[weak] power_label,
+            #[weak] clock_label,
+            #[weak] chart_ref,
+            #[upgrade_or] glib::ControlFlow::Break,
+            move || {
+                if let Some(comms::DaemonResponse::GetGpuStatus {
+                    temp_c, gpu_util, mem_util, power_w,
+                    mem_used_mb, mem_total_mb, clock_gpu_mhz, clock_mem_mhz, ..
+                }) = send_data(comms::DaemonCommand::GetGpuStatus) {
+                    temp_label.set_text(&format!("{temp_c}°C"));
+                    usage_label.set_text(&format!("{gpu_util}%"));
+                    vram_label.set_text(&format!("{mem_used_mb}/{mem_total_mb} MiB ({mem_util}%)"));
+                    power_label.set_text(&format!("{power_w:.1} W"));
+                    clock_label.set_text(&format!("GPU {clock_gpu_mhz} / Mem {clock_mem_mhz} MHz"));
+
+                    let mut h = hist_poll.borrow_mut();
+                    h.push_back(Sample { temp_c: temp_c as f64, gpu_pct: gpu_util as f64, power_w: power_w as f64 });
+                    while h.len() > CHART_HISTORY { h.pop_front(); }
+                    drop(h);
+                    chart_ref.queue_draw();
+                }
+                glib::ControlFlow::Continue
+            }
+        ));
+    }
+
+    scroll.set_child(Some(&page));
+    scroll
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────
+
 fn main() {
     setup_panic_hook();
-    gtk::init().or_crash("Failed to initialize GTK.");
 
     let device_file = std::fs::read_to_string(service::DEVICE_FILE)
         .or_crash("Failed to read the device file");
     let devices: Vec<SupportedDevice> = serde_json::from_str(&device_file)
         .or_crash("Failed to parse the device file");
-
     let device_name = get_device_name()
         .or_crash("Failed to get device name");
+    let device = devices.into_iter().find(|d| d.name == device_name)
+        .or_crash("Failed to find device config");
 
-    let app = Application::builder()
-        .application_id("com.example.hello") // TODO: Change this name
-        .build();
+    let app = RelmApp::new("io.github.razer-linux.razer-blade-control");
 
-    app.connect_activate(move |app| {
-        // For now we get the device from the device name. One is duplicated but
-        // its settings are the same.
-        // TODO: Document this or make it more robust
-        let device = devices.iter().find(|d| d.name == device_name)
-            .or_crash("Failed to get device info");
+    // Load minimal CSS overrides
+    relm4::set_global_css(include_str!("style.css"));
 
-        let window = ApplicationWindow::builder()
-            .application(app)
-            .default_width(640)
-            .default_height(480)
-            .title("Razer Settings")
-            .window_position(gtk::WindowPosition::Center)
-            .build();
+    // Force dark color scheme
+    let style_manager = adw::StyleManager::default();
+    style_manager.set_color_scheme(adw::ColorScheme::ForceDark);
 
-        let ac_settings_page = make_page(true, device.clone());
-        let battery_settings_page = make_page(false, device.clone());
-        let general_page = make_general_page();
-        let about_page = make_about_page(device.clone());
+    // Spawn tray icon
+    {
+        let (tray_sender, tray_receiver) = std::sync::mpsc::channel::<()>();
 
-        let stack = Stack::new();
-        stack.set_transition_type(gtk::StackTransitionType::SlideLeftRight);
-
-        stack.add_titled(&ac_settings_page.master_container, "AC", "AC");
-        stack.add_titled(&battery_settings_page.master_container, "Battery", "Battery");
-        stack.add_titled(&general_page.master_container, "General", "General");
-        stack.add_titled(&about_page.master_container, "About", "About");
-
-        stack.connect_screen_changed(|_, _| {
-            println!("Page changed");
+        // Poll the tray receiver periodically to present the window
+        glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+            if tray_receiver.try_recv().is_ok() {
+                if let Some(app) = gtk::gio::Application::default() {
+                    app.activate();
+                }
+            }
+            glib::ControlFlow::Continue
         });
 
-        let stack_switcher = StackSwitcher::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .build();
-
-        stack_switcher.set_stack(Some(&stack));
-        stack_switcher.set_halign(gtk::Align::Center);
-        stack_switcher.connect_screen_changed(|_, _| {
-            println!("Page changed");
+        std::thread::spawn(move || {
+            use ksni::blocking::TrayMethods;
+            let t = tray::RazerTray { show_window_sender: tray_sender };
+            match t.spawn() {
+                Ok(handle) => std::mem::forget(handle),
+                Err(e) => eprintln!("Warning: tray icon failed: {e}"),
+            }
         });
-        
-        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        let toolbar = Toolbar::new();
-        toolbar.style_context().add_class("primary-toolbar");
-        vbox.pack_start(&toolbar, false, false, 0);
-        vbox.pack_start(&stack, true, true, 0);
-        // header_bar.set_title(Some("Razer Settings"));
-        // header_bar.set_child(Some(&stack_switcher));
-        // window.set_titlebar(Some(&header_bar));
-        let tool_item = ToolItem::new();
-        gtk::prelude::ToolItemExt::set_expand(&tool_item, true);
-        tool_item.style_context().add_class("raised");
-        let stask_switcher_holder = Box::new(gtk::Orientation::Horizontal, 0);
-        stask_switcher_holder.set_border_width(1);
-        stask_switcher_holder.pack_start(&stack_switcher, true, true, 0);
-        tool_item.add(&stask_switcher_holder);
-        toolbar.insert(&tool_item, 0);
-
-        window.set_child(Some(&vbox));
-
-        window.show_all();
-
-        // If we know we are not running on AC, we show the battery tab by
-        // default
-        match check_if_running_on_ac_power() {
-            Some(false) => stack.set_visible_child_name("Battery"),
-            _ => {}
-        }
-    });
-
-    app.run();
-}
-
-fn make_page(ac: bool, device: SupportedDevice) -> SettingsPage {
-    let fan_speed = get_fan_speed(ac).or_crash("Error reading fan speed");
-    let brightness = get_brightness(ac).or_crash("Error reading brightness");
-    let power = get_power(ac);
-
-    let min_fan_speed = *device.fan.get(0)
-        .or_crash("Invalid fan values") as f64;
-    let max_fan_speed = *device.fan.get(1)
-        .or_crash("Invalid fan values") as f64;
-
-    let settings_page = SettingsPage::new();
-
-    // Logo section
-    if device.has_logo() {
-        let logo = get_logo(ac).or_crash("Error reading logo");
-        let settings_section = settings_page.add_section(Some("Logo"));
-            let label = Label::new(Some("Turn on logo"));
-            let logo_options = ComboBoxText::new();
-                logo_options.append_text("Off");
-                logo_options.append_text("On");
-                logo_options.append_text("Breathing");
-                logo_options.set_active(Some(logo as u32));
-            logo_options.connect_changed(move |options| {
-                let logo = options.active().or_crash("Illegal state") as u8;
-                set_logo(ac, logo);
-                let logo = get_logo(ac).or_crash("Error reading logo").clamp(0, 2);
-                options.set_active(Some(logo as u32));
-            });
-        let row = SettingsRow::new(&label, &logo_options);
-        settings_section.add_row(&row.master_container);
     }
 
-    // Power section
-    if let Some(power) = power {
-        let settings_section = settings_page.add_section(Some("Power"));
-            let label = Label::new(Some("Power Profile"));
-            let power_profile = ComboBoxText::new();
-                power_profile.append_text("Balanced");
-                power_profile.append_text("Gaming");
-                power_profile.append_text("Creator");
-                power_profile.append_text("Silent");
-                power_profile.append_text("Custom");
-                power_profile.set_active(Some(power.0 as u32));
-                power_profile.set_width_request(100);
-        let row = SettingsRow::new(&label, &power_profile);
-        settings_section.add_row(&row.master_container);
-            let label = Label::new(Some("CPU Boost"));
-            let cpu_boost = ComboBoxText::new();
-                cpu_boost.append_text("Low");
-                cpu_boost.append_text("Medium");
-                cpu_boost.append_text("High");
-                if device.can_boost() { cpu_boost.append_text("Boost") };
-                cpu_boost.set_active(Some(power.1 as u32));
-                cpu_boost.set_width_request(100);
-        let row = SettingsRow::new(&label, &cpu_boost);
-        let cpu_boost_row = &row.master_container;
-        settings_section.add_row(cpu_boost_row);
-            let label = Label::new(Some("GPU Boost"));
-            let gpu_boost = ComboBoxText::new();
-                gpu_boost.append_text("Low");
-                gpu_boost.append_text("Medium");
-                gpu_boost.append_text("High");
-                gpu_boost.set_active(Some(power.2 as u32));
-                gpu_boost.set_width_request(100);
-        let row = SettingsRow::new(&label, &gpu_boost);
-        let gpu_boost_row = &row.master_container;
-        settings_section.add_row(gpu_boost_row);
-
-        cpu_boost_row.show_all();
-        cpu_boost_row.set_no_show_all(true);
-        gpu_boost_row.show_all();
-        gpu_boost_row.set_no_show_all(true);
-        if power.0 == 4 {
-            cpu_boost_row.set_visible(true);
-            gpu_boost_row.set_visible(true);
-        } else {
-            cpu_boost_row.set_visible(false);
-            gpu_boost_row.set_visible(false);
-        }
-
-        power_profile.connect_changed(clone!(
-            @weak cpu_boost, @weak gpu_boost,
-            @weak cpu_boost_row, @weak gpu_boost_row
-            =>
-            move |power_profile| {
-                let profile = power_profile.active().or_crash("Illegal state") as u8;
-                let cpu     = cpu_boost.active().or_crash("Illegal state") as u8;
-                let gpu     = gpu_boost.active().or_crash("Illegal state") as u8;
-                set_power(ac, (profile, cpu, gpu)).or_crash("Error setting power");
-
-                let power = get_power(ac).or_crash("Error reading power");
-                power_profile.set_active(Some(power.0 as u32));
-                cpu_boost.set_active(Some(power.1 as u32));
-                gpu_boost.set_active(Some(power.2 as u32));
-
-                if power.0 == 4 {
-                    cpu_boost_row.set_visible(true);
-                    gpu_boost_row.set_visible(true);
-                } else {
-                    cpu_boost_row.set_visible(false);
-                    gpu_boost_row.set_visible(false);
-                }
-            }
-        ));
-        cpu_boost.connect_changed(clone!(
-            @weak power_profile, @weak gpu_boost
-            =>
-            move |cpu_boost| {
-                let profile = power_profile.active().or_crash("Illegal state") as u8;
-                let cpu     = cpu_boost.active().or_crash("Illegal state") as u8;
-                let gpu     = gpu_boost.active().or_crash("Illegal state") as u8;
-                set_power(ac, (profile, cpu, gpu)).or_crash("Error setting power");
-
-                let power = get_power(ac).or_crash("Error reading power");
-                power_profile.set_active(Some(power.0 as u32));
-                cpu_boost.set_active(Some(power.1 as u32));
-                gpu_boost.set_active(Some(power.2 as u32));
-            }
-        ));
-        gpu_boost.connect_changed(clone!(
-            @weak power_profile, @weak cpu_boost
-            =>
-            move |gpu_boost| {
-                let profile = power_profile.active().or_crash("Illegal state") as u8;
-                let cpu     = cpu_boost.active().or_crash("Illegal state") as u8;
-                let gpu     = gpu_boost.active().or_crash("Illegal state") as u8;
-                set_power(ac, (profile, cpu, gpu)).or_crash("Error setting power");
-
-                let power = get_power(ac).or_crash("Error reading power");
-                power_profile.set_active(Some(power.0 as u32));
-                cpu_boost.set_active(Some(power.1 as u32));
-                gpu_boost.set_active(Some(power.2 as u32));
-            }
-        ));
-    }
-
-    // Fan Speed Section
-    let settings_section = settings_page.add_section(Some("Fan Speed"));
-        let label = Label::new(Some("Auto"));
-        let switch = Switch::new();
-        let auto = fan_speed == 0;
-        switch.set_state(auto);
-    let row = SettingsRow::new(&label, &switch);
-    settings_section.add_row(&row.master_container);
-        let label = Label::new(Some("Fan Speed"));
-        let scale = Scale::with_range(gtk::Orientation::Horizontal, min_fan_speed, max_fan_speed, 1f64);
-        scale.set_value(fan_speed as f64);
-        scale.set_sensitive(fan_speed != 0);
-        scale.set_width_request(100);
-        scale.connect_change_value(clone!(@weak switch => @default-return gtk::glib::Propagation::Stop, move |scale, stype, value| {
-            let value = value.clamp(min_fan_speed, max_fan_speed);
-            set_fan_speed(ac, value as i32).or_crash("Error setting fan speed");
-            let fan_speed = get_fan_speed(ac).or_crash("Error reading fan speed");
-            let auto = fan_speed == 0;
-            scale.set_value(fan_speed as f64);
-            scale.set_sensitive(!auto);
-            switch.set_state(auto);
-            return gtk::glib::Propagation::Stop;
-        }));
-        switch.connect_changed_active(clone!(@weak scale => move |switch| {
-            set_fan_speed(ac, if switch.is_active() { 0 } else { min_fan_speed as i32 }).or_crash("Error setting fan speed");
-            let fan_speed = get_fan_speed(ac).or_crash("Error reading fan speed");
-            let auto = fan_speed == 0;
-            scale.set_value(fan_speed as f64);
-            scale.set_sensitive(!auto);
-            switch.set_state(auto);
-        }));
-    let row = SettingsRow::new(&label, &scale);
-    settings_section.add_row(&row.master_container);
-
-    // Keyboard Section
-    let settings_section = settings_page.add_section(Some("Keyboard"));
-        let label = Label::new(Some("Brightness"));
-        let scale = Scale::with_range(gtk::Orientation::Horizontal, 0f64, 100f64, 1f64);
-        scale.set_value(brightness as f64);
-        scale.set_width_request(100);
-        scale.connect_change_value(move |scale, stype, value| {
-            let value = value.clamp(0f64, 100f64);
-            set_brightness(ac, value as u8).or_crash("Error setting brigthness");
-            let brightness = get_brightness(ac).or_crash("Error reading brightness");
-            scale.set_value(brightness as f64);
-            return gtk::glib::Propagation::Stop;
-        });
-    let row = SettingsRow::new(&label, &scale);
-    settings_section.add_row(&row.master_container);
-
-    settings_page
-}
-
-fn make_general_page() -> SettingsPage {
-    let bho = get_bho();
-
-    let page = SettingsPage::new();
-
-    // Keyboard Section
-    let settings_section = page.add_section(Some("Keyboard"));
-        let label = Label::new(Some("Effect"));
-        let effect_options = ComboBoxText::new();
-            effect_options.append_text("Static");
-            effect_options.append_text("Static Gradient");
-            effect_options.append_text("Wave Gradient");
-            effect_options.append_text("Breathing");
-            effect_options.set_active(Some(0));
-    let row = SettingsRow::new(&label, &effect_options);
-    settings_section.add_row(&row.master_container);
-        let label = Label::new(Some("Color 1"));
-        let color_picker = ColorButton::new();
-    let row = SettingsRow::new(&label, &color_picker);
-    settings_section.add_row(&row.master_container);
-        let label = Label::new(Some("Color 2"));
-        let color_picker_2 = ColorButton::new();
-    let row = SettingsRow::new(&label, &color_picker_2);
-    settings_section.add_row(&row.master_container);
-        let label = Label::new(Some("Write effect"));
-        let button = Button::with_label("Write");
-        button.connect_clicked(clone!(@weak effect_options, @weak color_picker, @weak color_picker_2 =>
-            move |_| {
-                let color = color_picker.color();
-                let red   = (color.red   / 256) as u8;
-                let green = (color.green / 256) as u8;
-                let blue  = (color.blue  / 256) as u8;
-
-                let color = color_picker_2.color();
-                let red2   = (color.red   / 256) as u8;
-                let green2 = (color.green / 256) as u8;
-                let blue2  = (color.blue  / 256) as u8;
-
-                let effect = effect_options.active().or_crash("Illegal state");
-                match effect {
-                    0 => {
-                        set_effect("static", vec![red, green, blue])
-                            .or_crash("Failed to set effect");
-                    },
-                    1 => {
-                        set_effect(
-                            "static_gradient",
-                            vec![red, green, blue, red2, green2, blue2]
-                        ).or_crash("Failed to set effect");
-                    },
-                    2 => {
-                        set_effect("wave_gradient",
-                            vec![red, green, blue, red2, green2, blue2]
-                        ).or_crash("Failed to set effect");
-                    }
-                    3 => {
-                        set_effect(
-                            "breathing_single",
-                            vec![red, green, blue, 10]
-                        ).or_crash("Failed to set effect");
-                    }
-                    _ => {}
-                }
-            }
-        ));
-    let row = SettingsRow::new(&label, &button);
-    settings_section.add_row(&row.master_container);
-
-
-    effect_options.connect_changed(clone!(@weak color_picker, @weak color_picker_2 =>
-        move |options| {
-            let logo = options.active().or_crash("Illegal state"); // Unwrap: There is always one active
-            
-            match logo {
-                0 => {
-                    // TODO: Color 1 visible
-                },
-                1 => {
-                    // TODO: Color 1 and 2 visible
-                },
-                2 => {
-                    // TODO: Color 1 and 2 visible
-                }
-                3 => {
-                    // TODO: Color 1, 2, and duration visible
-                }
-                _ => {}
-            }
-        }
-    ));
-
-    // Battery Health Optimizer section
-    if let Some(bho) = bho {
-        let settings_section = page.add_section(Some("Battery Health Optimizer"));
-            let label = Label::new(Some("Enable Battery Health Optimizer"));
-            let switch = Switch::new();
-            switch.set_state(bho.0);
-        let row = SettingsRow::new(&label, &switch);
-        settings_section.add_row(&row.master_container);
-            let label = Label::new(Some("Theshold"));
-            let scale = Scale::with_range(gtk::Orientation::Horizontal, 65f64, 80f64, 1f64);
-            scale.set_value(bho.1 as f64);
-            scale.set_width_request(100);
-            scale.connect_change_value(clone!(@weak switch => @default-return gtk::glib::Propagation::Stop, move |scale, stype, value| {
-                let is_on = switch.is_active();
-                let threshold = value.clamp(50f64, 80f64) as u8;
-
-                set_bho(is_on, threshold).or_crash("Error setting bho");
-
-                let (is_on, threshold) = get_bho().or_crash("Error reading bho");
-                
-                scale.set_value(threshold as f64);
-                scale.set_visible(is_on);
-                scale.set_sensitive(is_on);
-
-                return gtk::glib::Propagation::Stop;
-            }));
-            scale.set_sensitive(bho.0);
-            switch.connect_changed_active(clone!(@weak scale => move |switch| {
-                let is_on = switch.is_active();
-                let threshold = scale.value().clamp(50f64, 80f64) as u8;
-                
-                set_bho(is_on, threshold); // Ignoramos errores ya que leemos
-                                           // el resultado de vuelta
-
-                let (is_on, threshold) = get_bho().or_crash("Error reading bho");
-                
-                scale.set_value(threshold as f64);
-                scale.set_visible(is_on);
-                scale.set_sensitive(is_on);
-            }));
-        let row = SettingsRow::new(&label, &scale);
-        settings_section.add_row(&row.master_container);
-    }
-
-    page
-}
-
-fn make_about_page(device: SupportedDevice) -> SettingsPage {
-    let page = SettingsPage::new();
-
-    // About page
-    let settings_section = page.add_section(Some("Razer Laptop Control"));
-        let label = Label::new(Some("Project"));
-        let url = LinkButton::with_label("https://github.com/JosuGZ/razer-laptop-control", "Project repository");
-    let row = SettingsRow::new(&label, &url);
-    settings_section.add_row(&row.master_container);
-        let report_bug_url = "https://github.com/JosuGZ/razer-laptop-control/issues/new?labels=bug&template=bug_report.md&title=%5BBUG%5D";
-        let label = Label::new(Some("Bug reports"));
-        let url = LinkButton::with_label(report_bug_url, "Report bug");
-    let row = SettingsRow::new(&label, &url);
-    settings_section.add_row(&row.master_container);
-        let label = Label::new(Some("Discord"));
-        let url = LinkButton::with_label("https://discord.gg/GdHKf45", "Razer Linux");
-    let row = SettingsRow::new(&label, &url);
-    settings_section.add_row(&row.master_container);
-
-    // Model section
-    let settings_section = page.add_section(Some("Laptop Information"));
-        let label = Label::new(Some("Model"));
-        let model_label = Label::new(Some(&device.name));
-    let row = SettingsRow::new(&label, &model_label);
-    settings_section.add_row(&row.master_container);
-        let label = Label::new(Some("Features"));
-        let features = device.features.join(", ");
-        let features_label = Label::new(Some(&features));
-    let row = SettingsRow::new(&label, &features_label);
-    settings_section.add_row(&row.master_container);
-
-    page
+    app.run::<App>(device);
 }

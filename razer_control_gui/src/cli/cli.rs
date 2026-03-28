@@ -31,6 +31,12 @@ enum Args {
         #[command(subcommand)]
         effect: Effect,
     },
+    /// Show NVIDIA GPU status
+    Gpu,
+    /// Read CPU power limits (PL1/PL2)
+    Pdl,
+    /// Set CPU power limits (PL1/PL2) in watts
+    SetPdl(PdlParams),
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -125,6 +131,14 @@ struct BhoParams {
     threshold: Option<u8>,
 }
 
+#[derive(Parser)]
+struct PdlParams {
+    /// PL1 sustained power limit in watts
+    pl1: u32,
+    /// PL2 boost power limit in watts
+    pl2: u32,
+}
+
 #[derive(ValueEnum, Clone)]
 enum AcState {
     /// battery
@@ -212,6 +226,20 @@ enum Effect {
     StaticGradient(StaticGradientParams),
     WaveGradient(WaveGradientParams),
     BreathingSingle(BreathingSingleParams),
+    BreathingDual(BreathingDualParams),
+    SpectrumCycle(SpectrumCycleParams),
+    RainbowWave(RainbowWaveParams),
+    Starlight(StarlightEffectParams),
+    Ripple(RippleParams),
+    Wheel(WheelParams),
+}
+
+#[derive(Parser)]
+struct WheelParams {
+    /// speed (1-10)
+    speed: u8,
+    /// direction (0=clockwise, 1=counter-clockwise)
+    direction: u8,
 }
 
 #[derive(Parser)]
@@ -266,6 +294,62 @@ struct BreathingSingleParams {
     blue: u8,
     /// duration (0-255)
     duration: u8,
+}
+
+#[derive(Parser)]
+struct BreathingDualParams {
+    /// red1 (0-255)
+    red1: u8,
+    /// green1 (0-255)
+    green1: u8,
+    /// blue1 (0-255)
+    blue1: u8,
+    /// red2 (0-255)
+    red2: u8,
+    /// green2 (0-255)
+    green2: u8,
+    /// blue2 (0-255)
+    blue2: u8,
+    /// duration in 100ms units (1-255)
+    duration: u8,
+}
+
+#[derive(Parser)]
+struct SpectrumCycleParams {
+    /// speed (1-10)
+    speed: u8,
+}
+
+#[derive(Parser)]
+struct RainbowWaveParams {
+    /// speed (1-10)
+    speed: u8,
+    /// direction (0=left, 1=right)
+    direction: u8,
+}
+
+#[derive(Parser)]
+struct StarlightEffectParams {
+    /// red (0-255)
+    red: u8,
+    /// green (0-255)
+    green: u8,
+    /// blue (0-255)
+    blue: u8,
+    /// density (1-20)
+    density: u8,
+}
+
+#[derive(Parser)]
+struct RippleParams {
+    /// red (0-255)
+    red: u8,
+    /// green (0-255)
+    green: u8,
+    /// blue (0-255)
+    blue: u8,
+    /// speed (1-10)
+    speed: u8,
 }
 
 fn main() {
@@ -339,6 +423,38 @@ fn main() {
                 "breathing_single".to_string(),
                 vec![params.red, params.green, params.blue, params.duration],
             ),
+            Effect::BreathingDual(params) => send_effect(
+                "breathing_dual".to_string(),
+                vec![
+                    params.red1,
+                    params.green1,
+                    params.blue1,
+                    params.red2,
+                    params.green2,
+                    params.blue2,
+                    params.duration,
+                ],
+            ),
+            Effect::SpectrumCycle(params) => send_effect(
+                "spectrum_cycle".to_string(),
+                vec![params.speed],
+            ),
+            Effect::RainbowWave(params) => send_effect(
+                "rainbow_wave".to_string(),
+                vec![params.speed, params.direction],
+            ),
+            Effect::Starlight(params) => send_effect(
+                "starlight".to_string(),
+                vec![params.red, params.green, params.blue, params.density],
+            ),
+            Effect::Ripple(params) => send_effect(
+                "ripple".to_string(),
+                vec![params.red, params.green, params.blue, params.speed],
+            ),
+            Effect::Wheel(params) => send_effect(
+                "wheel".to_string(),
+                vec![params.speed, params.direction],
+            ),
         },
         Args::StandardEffect { effect } => match effect {
             StandardEffect::Off => send_standard_effect("off".to_string(), vec![]),
@@ -380,6 +496,9 @@ fn main() {
                 send_standard_effect("wave".to_string(), vec![params.direction])
             }
         },
+        Args::Gpu => read_gpu_status(),
+        Args::Pdl => read_power_limits(),
+        Args::SetPdl(params) => write_power_limits(params.pl1, params.pl2),
     }
 }
 
@@ -710,5 +829,49 @@ fn write_sync(sync: bool) {
     match send_data(comms::DaemonCommand::SetSync { sync }) {
         Some(_) => read_sync(),
         None => eprintln!("Unknown error!"),
+    }
+}
+
+fn read_gpu_status() {
+    match send_data(comms::DaemonCommand::GetGpuStatus) {
+        Some(comms::DaemonResponse::GetGpuStatus {
+            name, temp_c, gpu_util, mem_util, power_w,
+            mem_used_mb, mem_total_mb, clock_gpu_mhz, clock_mem_mhz
+        }) => {
+            println!("GPU:         {}", name);
+            println!("Temperature: {}°C", temp_c);
+            println!("GPU Usage:   {}%", gpu_util);
+            println!("VRAM Usage:  {}% ({} / {} MiB)", mem_util, mem_used_mb, mem_total_mb);
+            println!("Power Draw:  {:.1} W", power_w);
+            println!("GPU Clock:   {} MHz", clock_gpu_mhz);
+            println!("Mem Clock:   {} MHz", clock_mem_mhz);
+        },
+        Some(_) => eprintln!("Daemon responded with invalid data!"),
+        None => eprintln!("GPU monitoring unavailable (nvidia-smi not found or failed)"),
+    }
+}
+
+fn read_power_limits() {
+    match send_data(comms::DaemonCommand::GetPowerLimits) {
+        Some(comms::DaemonResponse::GetPowerLimits { pl1_watts, pl2_watts, pl1_max_watts }) => {
+            println!("PL1 (sustained):  {} W", pl1_watts);
+            println!("PL2 (boost):      {} W", pl2_watts);
+            println!("Base TDP:         {} W", pl1_max_watts);
+        },
+        Some(_) => eprintln!("Daemon responded with invalid data!"),
+        None => eprintln!("Power limits unavailable (intel_rapl not found)"),
+    }
+}
+
+fn write_power_limits(pl1: u32, pl2: u32) {
+    match send_data(comms::DaemonCommand::SetPowerLimits { pl1_watts: pl1, pl2_watts: pl2 }) {
+        Some(comms::DaemonResponse::SetPowerLimits { result: true }) => {
+            println!("Power limits set: PL1={} W, PL2={} W", pl1, pl2);
+        },
+        Some(comms::DaemonResponse::SetPowerLimits { result: false }) => {
+            eprintln!("Failed to set power limits (permission denied?)");
+        },
+        Some(_) => eprintln!("Daemon responded with invalid data!"),
+        None => eprintln!("Failed to communicate with daemon"),
     }
 }

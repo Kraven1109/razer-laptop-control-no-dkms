@@ -26,6 +26,7 @@ pub struct EffectSave {
 /// An effect is a lighting function that is updated 30 times per second
 /// in order to create an animation of some description on the laptop's
 /// keyboard
+#[allow(dead_code)]
 pub trait Effect: Send + Sync {
     /// Returns a new instance of an Effect
     fn new(args: Vec<u8>) -> Box<dyn Effect>
@@ -102,7 +103,13 @@ impl EffectLayer {
             "Static" => Some(effects::Static::new(args)),
             "Wave Gradient" => Some(effects::WaveGradient::new(args)),
             "Breathing Single" => Some(effects::BreathSingle::new(args)),
+            "Breathing Dual" => Some(effects::BreathDual::new(args)),
             "Static Gradient" => Some(effects::StaticGradient::new(args)),
+            "Spectrum Cycle" => Some(effects::SpectrumCycle::new(args)),
+            "Rainbow Wave" => Some(effects::RainbowWave::new(args)),
+            "Starlight" => Some(effects::Starlight::new(args)),
+            "Ripple" => Some(effects::Ripple::new(args)),
+            "Wheel" => Some(effects::Wheel::new(args)),
             _ => None,
         };
         if effect.is_none() {
@@ -117,10 +124,6 @@ impl EffectLayer {
 
     pub fn get_state(&mut self) -> Vec<u8> {
         self.effect.get_state()
-    }
-    #[allow(dead_code)]
-    pub fn get_mask(&mut self) -> Vec<bool> {
-        self.key_mask.to_vec()
     }
 }
 pub struct EffectManager {

@@ -1,9 +1,13 @@
 [Unit]
 Description=Razer laptop control daemon
+After=local-fs.target
 
 [Service]
 Type=simple
 ExecStart=/usr/share/razercontrol/daemon
+Restart=on-failure
+RestartSec=3
+ExecStopPost=-/bin/rm -f /tmp/razercontrol-socket
 
 [Install]
 WantedBy=default.target
