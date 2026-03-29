@@ -8,6 +8,7 @@ fn cli(args: &[&str]) {
 
 pub struct RazerTray {
     pub show_window_sender: mpsc::Sender<()>,
+    pub restart_sender: mpsc::Sender<()>,
 }
 
 impl ksni::Tray for RazerTray {
@@ -153,6 +154,15 @@ impl ksni::Tray for RazerTray {
             }
             .into(),
             MenuItem::Separator,
+            StandardItem {
+                label: "Restart App".into(),
+                icon_name: "view-refresh-symbolic".into(),
+                activate: Box::new(|this: &mut Self| {
+                    let _ = this.restart_sender.send(());
+                }),
+                ..Default::default()
+            }
+            .into(),
             StandardItem {
                 label: "Quit".into(),
                 icon_name: "application-exit".into(),

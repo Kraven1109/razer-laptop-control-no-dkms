@@ -124,10 +124,22 @@ per-effect speed, direction, density, and duration sliders, plus primary/seconda
 
 The tray icon appears automatically when `razer-settings` is running.
 Provides quick access to power modes, fan speed, brightness, keyboard effects,
-and standard effects.
+standard effects, and app controls.
 
 - **KDE Plasma:** Works natively (StatusNotifierItem)
 - **GNOME:** Install the AppIndicator/KStatusNotifierItem extension
+
+**Tray actions:**
+- Click icon or "Open Settings" — show the main window
+- "Restart App" — re-launch the GUI (useful after daemon restart)
+- "Quit" — exit the GUI (daemon keeps running)
+
+**Start minimized to tray** (useful for autostart):
+```bash
+razer-settings --minimized   # or: razer-settings -m
+```
+Add this to KDE Autostart / systemd user service to have the GUI live in the tray
+without showing a window on login.
 
 ## Architecture
 

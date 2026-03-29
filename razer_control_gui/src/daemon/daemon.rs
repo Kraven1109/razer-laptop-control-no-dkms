@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::{atomic::{AtomicU64, Ordering}, Mutex};
+use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time;
 
@@ -36,6 +36,9 @@ lazy_static! {
     /// mitigating EC interrupt contention with NVPCF Dynamic Boost
     /// that causes PRIME pipeline stalls (display flicker).
     static ref ANIM_SLEEP_MS: AtomicU64 = AtomicU64::new(kbd::ANIMATION_SLEEP_MS);
+    /// Set to true while the system is suspended so GPU polling and HID
+    /// writes are suppressed until the device is re-opened after resume.
+    static ref SYSTEM_SLEEPING: AtomicBool = AtomicBool::new(false);
 }
 
 // Main function for daemon
@@ -135,8 +138,14 @@ pub fn start_keyboard_animator_task() -> JoinHandle<()> {
     // Start the keyboard animator thread,
     thread::spawn(|| {
         loop {
-            if let Some(laptop) = DEV_MANAGER.lock().unwrap().get_device() {
-                EFFECT_MANAGER.lock().unwrap().update(laptop);
+            // Skip USB writes entirely while device is suspended — the HID fd
+            // is closed during sleep and writes would fail or spin-wait.
+            if !SYSTEM_SLEEPING.load(Ordering::Relaxed) {
+                if let (Ok(mut dev), Ok(mut fx)) = (DEV_MANAGER.lock(), EFFECT_MANAGER.lock()) {
+                    if let Some(laptop) = dev.get_device() {
+                        fx.update(laptop);
+                    }
+                }
             }
             thread::sleep(std::time::Duration::from_millis(
                 ANIM_SLEEP_MS.load(Ordering::Relaxed)
@@ -154,7 +163,16 @@ pub fn start_gpu_load_monitor_task() -> JoinHandle<()> {
     thread::spawn(|| {
         loop {
             thread::sleep(std::time::Duration::from_secs(5));
+            // Skip GPU polling while system is suspended — avoids waking the
+            // NVIDIA GPU out of D3cold and prevents stale nvidia-smi calls.
+            if SYSTEM_SLEEPING.load(Ordering::Relaxed) {
+                continue;
+            }
             if let Some(status) = gpu::query_nvidia_gpu() {
+                // Populate the GPU status cache so GetGpuStatus requests from
+                // the GUI are served without spawning additional nvidia-smi
+                // processes — one nvidia-smi every 5 s is enough.
+                gpu::store_gpu_cache(&status);
                 let new_sleep = if status.gpu_util >= 70 {
                     333 // ~3 FPS — reduced EC traffic during heavy GPU load
                 } else if status.gpu_util <= 20 {
@@ -175,13 +193,16 @@ fn start_screensaver_monitor_task() -> JoinHandle<()> {
         // Uses org.freedesktop.ScreenSaver which is supported by both KDE Plasma and GNOME
         let proxy = dbus_session.with_proxy("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", time::Duration::from_millis(5000));
         let _id = proxy.match_signal(|h: screensaver::OrgFreedesktopScreenSaverActiveChanged, _: &Connection, _: &Message| {
-            println!("ActiveChanged {:?}", h.arg0);
-            if let Ok(mut d) = DEV_MANAGER.lock() {
-                if h.arg0 {
-                    d.light_off();
-                } else {
-                    d.restore_light();
+            // Ignore screensaver events while the system is suspended — the HID
+            // device is closed and restore_light() would fail silently.
+            if SYSTEM_SLEEPING.load(Ordering::Relaxed) {
+                return true;
+            }
+            match DEV_MANAGER.lock() {
+                Ok(mut d) => {
+                    if h.arg0 { d.light_off(); } else { d.restore_light(); }
                 }
+                Err(e) => error!("DEV_MANAGER lock failed in screensaver handler: {}", e),
             }
             true
         });
@@ -236,19 +257,52 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
         });
 
         let _id = proxy_login.match_signal(|h: login1::OrgFreedesktopLogin1ManagerPrepareForSleep, _: &Connection, _: &Message| {
-            info!("PrepareForSleep {:?}", h.start);
-            if let Ok(mut d) = DEV_MANAGER.lock() {
-                d.set_ac_state_get();
-                if h.start {
+            info!("PrepareForSleep start={}", h.start);
+            if h.start {
+                // Going to sleep: blank keyboard then close HID device so the
+                // USB subsystem can suspend the endpoint cleanly, avoiding
+                // the multi-second stall that occurs when the kernel tears
+                // down a device that still has open file descriptors.
+                SYSTEM_SLEEPING.store(true, Ordering::SeqCst);
+                if let Ok(mut d) = DEV_MANAGER.lock() {
                     d.light_off();
-                } else {
-                    d.restore_light();
+                    d.device = None; // drop HidDevice → close fd → USB can suspend
                 }
+            } else {
+                // Waking up: USB host re-enumerates devices; retry discovery
+                // for up to ~2 seconds to handle slow controller init.
+                thread::sleep(std::time::Duration::from_millis(500));
+                let mut discovered = false;
+                for attempt in 0..5_u32 {
+                    let has_device = match DEV_MANAGER.lock() {
+                        Ok(mut d) => { d.discover_devices(); d.device.is_some() }
+                        Err(e) => { error!("DEV_MANAGER lock failed on resume: {}", e); break; }
+                    };
+                    if has_device {
+                        info!("HID device ready after resume (attempt {})", attempt + 1);
+                        discovered = true;
+                        break;
+                    }
+                    warn!("HID device not ready on resume attempt {}, retrying in 300 ms", attempt + 1);
+                    thread::sleep(std::time::Duration::from_millis(300));
+                }
+                if !discovered {
+                    warn!("HID device unavailable after 5 attempts; backlight will remain off");
+                }
+                if let Ok(mut d) = DEV_MANAGER.lock() {
+                    d.set_ac_state_get();
+                    if discovered { d.restore_light(); }
+                }
+                SYSTEM_SLEEPING.store(false, Ordering::SeqCst);
             }
             true
         });
 
-        loop { dbus_system.process(time::Duration::from_millis(1000)).unwrap(); }
+        loop {
+            if let Err(e) = dbus_system.process(time::Duration::from_millis(1000)) {
+                error!("D-Bus system connection error: {}", e);
+            }
+        }
     })
 }
 
@@ -417,7 +471,19 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
             }
 
             comms::DaemonCommand::GetGpuStatus => {
-                if let Some(status) = gpu::query_nvidia_gpu() {
+                // Use the cache populated by the GPU load monitor to avoid
+                // spawning a second nvidia-smi per GUI poll cycle.
+                // Fall back to a direct query only if the cache is cold
+                // (e.g., first request after daemon start).
+                let status = gpu::get_cached_gpu_status().or_else(|| {
+                    if SYSTEM_SLEEPING.load(Ordering::Relaxed) { None }
+                    else {
+                        let s = gpu::query_nvidia_gpu();
+                        if let Some(ref s) = s { gpu::store_gpu_cache(s); }
+                        s
+                    }
+                });
+                if let Some(status) = status {
                     return Some(comms::DaemonResponse::GetGpuStatus {
                         name: status.name,
                         temp_c: status.temp_c,

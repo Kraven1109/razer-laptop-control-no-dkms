@@ -1,5 +1,27 @@
 use std::process::Command;
+use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
+use lazy_static::lazy_static;
+
+lazy_static! {
+    /// Most recent GPU snapshot taken by the GPU load monitor.
+    /// The GUI's GetGpuStatus handler reads from this cache so that only one
+    /// nvidia-smi subprocess is spawned per 5-second monitor cycle rather than
+    /// once per 3-second GUI poll.
+    static ref GPU_STATUS_CACHE: Mutex<Option<GpuStatus>> = Mutex::new(None);
+}
+
+/// Store a freshly queried status into the cache.
+pub fn store_gpu_cache(status: &GpuStatus) {
+    if let Ok(mut cache) = GPU_STATUS_CACHE.lock() {
+        *cache = Some(status.clone());
+    }
+}
+
+/// Return the most recently cached GPU status without spawning nvidia-smi.
+pub fn get_cached_gpu_status() -> Option<GpuStatus> {
+    GPU_STATUS_CACHE.lock().ok().and_then(|g| g.clone())
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct GpuStatus {

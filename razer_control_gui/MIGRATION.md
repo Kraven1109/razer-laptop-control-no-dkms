@@ -309,3 +309,57 @@ src/
     ├── style.css                   # Minimal Libadwaita CSS overrides
     └── util.rs                     # AC power check utility
 ```
+
+---
+
+## 18. Sleep/Resume & Shutdown Investigation
+
+### Sudden Shutdown Root Cause
+
+- **Boot -1 crash analysis:** last journal entries show GPU spiking 10W → 63W instantaneously.  
+  Battery was at 51% (~50 Wh). No kernel panic, no NTFS3 errors — clean log until abrupt silence.  
+- **Probable cause:** instantaneous power demand (GPU + CPU combined ≈ 110–150 W) exceeded  
+  battery discharge protection threshold (hardware OCP/UVP) → hard power-off.  
+- **NTFS3 corruption (/DATA2)** is a consequence: the NTFS3 driver doesn't get a clean unmount  
+  when power is cut. Run `ntfsfix /dev/sdX` or boot Windows to trigger chkdsk.
+
+### Sleep/Resume Latency Root Cause & Fix
+
+**Root cause:** the daemon held an open `HidDevice` file descriptor across suspend/resume.  
+The Linux USB subsystem must force-tear down active endpoints before PCI `D3cold`, causing  
+a multi-second stall on suspend. On resume, the old fd is stale and `restore_light()` silently  
+fails → keyboard backlight stays off.
+
+**Fixes applied in this session:**
+
+| File | Change |
+|------|--------|
+| `daemon/daemon.rs` | `SYSTEM_SLEEPING: AtomicBool` flag added |
+| `daemon/daemon.rs` | `PrepareForSleep(true)`: set flag → `light_off()` → `d.device = None` (close HID fd) |
+| `daemon/daemon.rs` | `PrepareForSleep(false)`: retry `discover_devices()` up to 5× with 300 ms backoff → `set_ac_state_get()` → `restore_light()` |
+| `daemon/daemon.rs` | `start_keyboard_animator_task()`: skip USB writes while `SYSTEM_SLEEPING` is set |
+| `daemon/daemon.rs` | `start_gpu_load_monitor_task()`: skip `nvidia-smi` calls while `SYSTEM_SLEEPING` is set |
+| `daemon/daemon.rs` | Screensaver handler: ignore unlock event if `SYSTEM_SLEEPING` |
+| `daemon/daemon.rs` | D-Bus process loop: `unwrap()` → graceful `error!()` logging |
+
+### GPU Status Cache (nvidia-smi Reduction)
+
+| Before | After |
+|--------|-------|
+| `nvidia-smi` spawned per GUI poll (every 3 s) + GPU monitor (every 5 s) | GPU monitor owns the single `nvidia-smi` call; `GetGpuStatus` reads `GPU_STATUS_CACHE` |
+| ≈ 12–20 subprocess spawns/minute | ≈ 12 subprocess spawns/minute (one per 5 s) |
+
+---
+
+## 19. GUI Improvements (this session)
+
+- **VRAM percentage fix:** changed from `mem_util` (nvidia-smi memory *bandwidth* %) to  
+  `mem_used_mb * 100 / mem_total_mb` (actual VRAM *capacity* %). Previously showed ~0–20%  
+  even when 15/16 GB was allocated.
+- **Memory bandwidth chart series added:** dashed purple line (`MemBW`) on Performance  
+  Timeline chart — shows `utilization.memory` from nvidia-smi (bandwidth saturation,  
+  useful for AI/ML workloads that saturate HBM bandwidth).
+- **Tray: Start Minimized:** `razer-settings --minimized` / `-m` starts with window hidden.  
+  Useful for autostart entries — app lives in tray without cluttering the desktop.
+- **Tray: Restart App:** new tray menu item re-launches the current binary and exits cleanly.
+

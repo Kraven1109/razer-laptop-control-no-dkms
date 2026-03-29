@@ -4,10 +4,12 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use adw::prelude::*;
 use gtk::glib;
 use relm4::prelude::*;
+use lazy_static::lazy_static;
 
 #[path = "../comms.rs"]
 mod comms;
@@ -20,6 +22,12 @@ use service::SupportedDevice;
 use error_handling::*;
 use widgets::ColorWheel;
 use util::*;
+
+lazy_static! {
+    /// Set when the binary is started with --minimized / -m; causes the
+    /// main window to stay hidden until opened from the tray icon.
+    static ref START_MINIMIZED: AtomicBool = AtomicBool::new(false);
+}
 
 // ── Daemon communication helpers ──────────────────────────────────────────
 
@@ -223,6 +231,12 @@ impl SimpleComponent for App {
             win.set_visible(false);
             glib::Propagation::Stop
         });
+
+        // Start hidden if --minimized was passed
+        if START_MINIMIZED.load(Ordering::Relaxed) {
+            let root_clone = root.clone();
+            glib::idle_add_local_once(move || root_clone.set_visible(false));
+        }
 
         ComponentParts { model, widgets }
     }
@@ -741,7 +755,8 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
 
         let temp_label = gtk::Label::builder().label(&format!("{temp_c}°C")).css_classes(["monospace"]).build();
         let usage_label = gtk::Label::builder().label(&format!("{gpu_util}%")).css_classes(["monospace"]).build();
-        let vram_label = gtk::Label::builder().label(&format!("{mem_used_mb}/{mem_total_mb} MiB ({mem_util}%)")).css_classes(["monospace"]).build();
+        let mem_pct = if mem_total_mb > 0 { mem_used_mb * 100 / mem_total_mb } else { 0 };
+        let vram_label = gtk::Label::builder().label(&format!("{mem_used_mb}/{mem_total_mb} MiB ({mem_pct}%)")).css_classes(["monospace"]).build();
         let power_label = gtk::Label::builder().label(&format!("{power_w:.1} W")).css_classes(["monospace"]).build();
         let tgp_label = gtk::Label::builder().label(&format!("{power_limit_w:.0} W (default)")).css_classes(["monospace"]).build();
         let clock_label = gtk::Label::builder().label(&format!("GPU {clock_gpu_mhz} / Mem {clock_mem_mhz} MHz")).css_classes(["monospace"]).build();
@@ -768,6 +783,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
         struct Sample {
             temp_c: f64,
             gpu_pct: f64,
+            mem_bw_pct: f64, // GPU memory bandwidth utilisation (nvidia-smi utilization.memory)
             power_w: f64,
         }
 
@@ -775,12 +791,12 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
         let tgp_limit: Rc<RefCell<f64>> = Rc::new(RefCell::new(power_limit_w as f64));
         {
             let mut h = history.borrow_mut();
-            h.push_back(Sample { temp_c: temp_c as f64, gpu_pct: gpu_util as f64, power_w: power_w as f64 });
+            h.push_back(Sample { temp_c: temp_c as f64, gpu_pct: gpu_util as f64, mem_bw_pct: mem_util as f64, power_w: power_w as f64 });
         }
 
         let chart_group = adw::PreferencesGroup::builder()
             .title("Performance Timeline")
-            .description("Temperature / GPU usage / Power — last 60 s")
+            .description("Temperature / GPU compute / Mem BW / Power — last 60 s")
             .build();
 
         let chart = gtk::DrawingArea::new();
@@ -864,8 +880,27 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
             let hist_ref: &VecDeque<Sample> = &hist;
             // Temp (orange)
             draw_line(&|i| hist_ref[i].temp_c, 1.0, 0.6, 0.2, 100.0);
-            // GPU % (green)
+            // GPU compute % (green)
             draw_line(&|i| hist_ref[i].gpu_pct, 0.27, 1.0, 0.63, 100.0);
+            // Memory bandwidth % (purple, dashed — same 0-100 scale as GPU%)
+            cr.set_source_rgba(0.8, 0.4, 1.0, 0.85);
+            cr.set_line_width(2.0);
+            cr.set_dash(&[6.0, 4.0], 0.0);
+            {
+                let start_idx = if n > CHART_HISTORY { n - CHART_HISTORY } else { 0 };
+                let points: Vec<(f64, f64)> = (start_idx..n).enumerate().map(|(i, idx)| {
+                    let x = pad_l + i as f64 * x_step;
+                    let val = hist_ref[idx].mem_bw_pct.clamp(0.0, 100.0);
+                    let y = pad_t + ch * (1.0 - val / 100.0);
+                    (x, y)
+                }).collect();
+                if let Some(&(x0, y0)) = points.first() {
+                    cr.move_to(x0, y0);
+                    for &(x, y) in &points[1..] { cr.line_to(x, y); }
+                    let _ = cr.stroke();
+                }
+            }
+            cr.set_dash(&[], 0.0);
             // Power (cyan, scaled 0-200W → 0-100)
             draw_line(&|i| hist_ref[i].power_w * (100.0 / 200.0), 0.3, 0.8, 1.0, 100.0);
 
@@ -888,7 +923,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
 
             // Legend
             cr.set_font_size(10.0);
-            let legend = [("Temp", 1.0_f64, 0.6, 0.2), ("GPU%", 0.27, 1.0, 0.63), ("W draw", 0.3, 0.8, 1.0)];
+            let legend = [("Temp", 1.0_f64, 0.6, 0.2), ("GPU%", 0.27, 1.0, 0.63), ("MemBW", 0.8, 0.4, 1.0), ("Power", 0.3, 0.8, 1.0)];
             let mut lx = pad_l + 4.0;
             for (label, r, g, b) in &legend {
                 cr.set_source_rgb(*r, *g, *b);
@@ -923,14 +958,15 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
                 }) = send_data(comms::DaemonCommand::GetGpuStatus) {
                     temp_label.set_text(&format!("{temp_c}°C"));
                     usage_label.set_text(&format!("{gpu_util}%"));
-                    vram_label.set_text(&format!("{mem_used_mb}/{mem_total_mb} MiB ({mem_util}%)"));
+                    let mem_pct = if mem_total_mb > 0 { mem_used_mb * 100 / mem_total_mb } else { 0 };
+                    vram_label.set_text(&format!("{mem_used_mb}/{mem_total_mb} MiB ({mem_pct}%)"));
                     power_label.set_text(&format!("{power_w:.1} W"));
                     tgp_label.set_text(&format!("{power_limit_w:.0} W (default)"));
                     clock_label.set_text(&format!("GPU {clock_gpu_mhz} / Mem {clock_mem_mhz} MHz"));
 
                     *tgp_poll.borrow_mut() = power_limit_w as f64;
                     let mut h = hist_poll.borrow_mut();
-                    h.push_back(Sample { temp_c: temp_c as f64, gpu_pct: gpu_util as f64, power_w: power_w as f64 });
+                    h.push_back(Sample { temp_c: temp_c as f64, gpu_pct: gpu_util as f64, mem_bw_pct: mem_util as f64, power_w: power_w as f64 });
                     while h.len() > CHART_HISTORY { h.pop_front(); }
                     drop(h);
                     chart_ref.queue_draw();
@@ -948,6 +984,13 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
 
 fn main() {
     setup_panic_hook();
+
+    // Parse CLI flags before GTK/relm4 consumes argv
+    // --minimized / -m : start with the window hidden; show from tray icon
+    let minimized = std::env::args().any(|a| a == "--minimized" || a == "-m");
+    if minimized {
+        START_MINIMIZED.store(true, Ordering::Relaxed);
+    }
 
     let device_file = std::fs::read_to_string(service::DEVICE_FILE)
         .or_crash("Failed to read the device file");
@@ -970,20 +1013,27 @@ fn main() {
     // Spawn tray icon
     {
         let (tray_sender, tray_receiver) = std::sync::mpsc::channel::<()>();
+        let (restart_sender, restart_receiver) = std::sync::mpsc::channel::<()>();
 
-        // Poll the tray receiver periodically to present the window
+        // Poll the tray receiver periodically to present the window or restart
         glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
             if tray_receiver.try_recv().is_ok() {
                 if let Some(app) = gtk::gio::Application::default() {
                     app.activate();
                 }
             }
+            if restart_receiver.try_recv().is_ok() {
+                // Re-launch the current binary and exit
+                let exe = std::env::current_exe().unwrap_or_else(|_| "razer-settings".into());
+                let _ = std::process::Command::new(exe).spawn();
+                std::process::exit(0);
+            }
             glib::ControlFlow::Continue
         });
 
         std::thread::spawn(move || {
             use ksni::blocking::TrayMethods;
-            let t = tray::RazerTray { show_window_sender: tray_sender };
+            let t = tray::RazerTray { show_window_sender: tray_sender, restart_sender };
             match t.spawn() {
                 Ok(handle) => std::mem::forget(handle),
                 Err(e) => eprintln!("Warning: tray icon failed: {e}"),
