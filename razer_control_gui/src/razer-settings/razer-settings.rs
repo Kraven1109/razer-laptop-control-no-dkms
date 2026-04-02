@@ -708,50 +708,15 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
 
     let page = adw::PreferencesPage::new();
 
-    // System Information
-    {
-        let group = adw::PreferencesGroup::builder().title("System Information").build();
-
-        let add_info = |title: &str, value: &str| {
-            let row = adw::ActionRow::builder()
-                .title(title)
-                .build();
-            row.add_suffix(&gtk::Label::builder().label(value).css_classes(["monospace"]).build());
-            group.add(&row);
-        };
-
-        add_info("Device", &device.name);
-
-        let dmi_product = std::fs::read_to_string("/sys/devices/virtual/dmi/id/product_name")
-            .unwrap_or_default().trim().to_string();
-        let dmi_vendor = std::fs::read_to_string("/sys/devices/virtual/dmi/id/sys_vendor")
-            .unwrap_or_default().trim().to_string();
-        let dmi_bios = std::fs::read_to_string("/sys/devices/virtual/dmi/id/bios_version")
-            .unwrap_or_default().trim().to_string();
-
-        if !dmi_product.is_empty() {
-            let host = if dmi_vendor.is_empty() { dmi_product } else { format!("{dmi_vendor} {dmi_product}") };
-            add_info("Host", &host);
-        }
-        add_info("USB ID", &format!("{}:{}", device.vid, device.pid));
-        add_info("Features", &device.features.join(", "));
-        if !dmi_bios.is_empty() { add_info("BIOS", &dmi_bios); }
-        add_info("Fan Range", &format!("{} – {} RPM",
-            device.fan.first().unwrap_or(&0), device.fan.get(1).unwrap_or(&0)));
-
-        page.add(&group);
-    }
-
-    // GPU section
     if let Some(comms::DaemonResponse::GetGpuStatus {
-        name, temp_c, gpu_util, mem_util, power_w, power_limit_w,
-        mem_used_mb, mem_total_mb, clock_gpu_mhz, clock_mem_mhz,
+        name, temp_c, gpu_util, power_w, power_limit_w,
+        mem_used_mb, mem_total_mb, clock_gpu_mhz, clock_mem_mhz, ..
     }) = send_data(comms::DaemonCommand::GetGpuStatus) {
-        let group = adw::PreferencesGroup::builder().title("NVIDIA GPU").build();
-
-        let gpu_row = adw::ActionRow::builder().title("GPU").build();
-        gpu_row.add_suffix(&gtk::Label::builder().label(&name).css_classes(["monospace"]).build());
-        group.add(&gpu_row);
+        let gpu_expander = adw::ExpanderRow::builder()
+            .title("NVIDIA GPU")
+            .subtitle(&name)
+            .expanded(true)
+            .build();
 
         let temp_label = gtk::Label::builder().label(&format!("{temp_c}°C")).css_classes(["monospace"]).build();
         let usage_label = gtk::Label::builder().label(&format!("{gpu_util}%")).css_classes(["monospace"]).build();
@@ -761,20 +726,18 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
         let tgp_label = gtk::Label::builder().label(&format!("{power_limit_w:.0} W (default)")).css_classes(["monospace"]).build();
         let clock_label = gtk::Label::builder().label(&format!("GPU {clock_gpu_mhz} / Mem {clock_mem_mhz} MHz")).css_classes(["monospace"]).build();
 
-        let make_row = |title: &str, suffix: &gtk::Label| {
+        let make_row = |title: &str, suffix: &gtk::Label| -> adw::ActionRow {
             let row = adw::ActionRow::builder().title(title).build();
             row.add_suffix(suffix);
-            group.add(&row);
+            row
         };
 
-        make_row("Temperature", &temp_label);
-        make_row("GPU Usage", &usage_label);
-        make_row("VRAM", &vram_label);
-        make_row("Power Draw", &power_label);
-        make_row("TGP Limit", &tgp_label);
-        make_row("Clocks", &clock_label);
-
-        page.add(&group);
+        gpu_expander.add_row(&make_row("Temperature", &temp_label));
+        gpu_expander.add_row(&make_row("GPU Usage", &usage_label));
+        gpu_expander.add_row(&make_row("VRAM", &vram_label));
+        gpu_expander.add_row(&make_row("Power Draw", &power_label));
+        gpu_expander.add_row(&make_row("TGP Limit", &tgp_label));
+        gpu_expander.add_row(&make_row("Clocks", &clock_label));
 
         // ── Timeline chart ────────────────────────────────────────────
         const CHART_HISTORY: usize = 20; // 20 samples × 3s = 60s window
@@ -783,7 +746,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
         struct Sample {
             temp_c: f64,
             gpu_pct: f64,
-            mem_bw_pct: f64, // GPU memory bandwidth utilisation (nvidia-smi utilization.memory)
+            vram_pct: f64,   // VRAM capacity used % (mem_used / mem_total × 100)
             power_w: f64,
         }
 
@@ -791,16 +754,16 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
         let tgp_limit: Rc<RefCell<f64>> = Rc::new(RefCell::new(power_limit_w as f64));
         {
             let mut h = history.borrow_mut();
-            h.push_back(Sample { temp_c: temp_c as f64, gpu_pct: gpu_util as f64, mem_bw_pct: mem_util as f64, power_w: power_w as f64 });
+            h.push_back(Sample { temp_c: temp_c as f64, gpu_pct: gpu_util as f64, vram_pct: if mem_total_mb > 0 { mem_used_mb as f64 * 100.0 / mem_total_mb as f64 } else { 0.0 }, power_w: power_w as f64 });
         }
 
         let chart_group = adw::PreferencesGroup::builder()
             .title("Performance Timeline")
-            .description("Temperature / GPU compute / Mem BW / Power — last 60 s")
+            .description("Temperature · GPU% · VRAM% · Power — last 60 s")
             .build();
 
         let chart = gtk::DrawingArea::new();
-        chart.set_size_request(-1, 180);
+        chart.set_size_request(-1, 260);
         chart.set_margin_start(12);
         chart.set_margin_end(12);
         chart.set_margin_bottom(8);
@@ -814,12 +777,16 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
             let n = hist.len();
             if n < 2 { return; }
 
-            let pad_l = 40.0;
-            let pad_r = 72.0; // wider: % + W dual axis
-            let pad_t = 10.0;
-            let pad_b = 20.0;
+            let pad_l = 42.0;
+            let pad_r = 76.0;
+            let pad_t = 12.0;
+            let pad_b = 28.0;
             let cw = w - pad_l - pad_r;
             let ch = h - pad_t - pad_b;
+
+            // Adaptive font sizes — scale with chart height for readability
+            let fs_axis = (ch * 0.052).clamp(8.5, 11.0);
+            let fs_legend = (ch * 0.056).clamp(9.5, 12.0);
 
             // Background
             cr.set_source_rgba(0.12, 0.12, 0.14, 1.0);
@@ -836,11 +803,11 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
             }
 
             // Y-axis labels: left = °C (orange), right col1 = GPU% (green), col2 = Watts (cyan)
-            cr.set_font_size(9.0);
+            cr.set_font_size(fs_axis);
             for i in 0..=4 {
                 let val = 100 - i * 25;  // 100, 75, 50, 25, 0
                 let watts = val * 2;     // 200, 150, 100, 50, 0
-                let y = pad_t + ch * (i as f64 / 4.0) + 3.0;
+                let y = pad_t + ch * (i as f64 / 4.0) + fs_axis * 0.38;
                 // Temp axis (left, orange)
                 cr.set_source_rgba(1.0, 0.6, 0.2, 0.85);
                 cr.move_to(2.0, y);
@@ -851,7 +818,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
                 let _ = cr.show_text(&format!("{val}%"));
                 // Watts axis (right outer, cyan)
                 cr.set_source_rgba(0.3, 0.8, 1.0, 0.85);
-                cr.move_to(w - pad_r + 32.0, y);
+                cr.move_to(w - pad_r + 34.0, y);
                 let _ = cr.show_text(&format!("{watts}W"));
             }
 
@@ -882,25 +849,8 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
             draw_line(&|i| hist_ref[i].temp_c, 1.0, 0.6, 0.2, 100.0);
             // GPU compute % (green)
             draw_line(&|i| hist_ref[i].gpu_pct, 0.27, 1.0, 0.63, 100.0);
-            // Memory bandwidth % (purple, dashed — same 0-100 scale as GPU%)
-            cr.set_source_rgba(0.8, 0.4, 1.0, 0.85);
-            cr.set_line_width(2.0);
-            cr.set_dash(&[6.0, 4.0], 0.0);
-            {
-                let start_idx = if n > CHART_HISTORY { n - CHART_HISTORY } else { 0 };
-                let points: Vec<(f64, f64)> = (start_idx..n).enumerate().map(|(i, idx)| {
-                    let x = pad_l + i as f64 * x_step;
-                    let val = hist_ref[idx].mem_bw_pct.clamp(0.0, 100.0);
-                    let y = pad_t + ch * (1.0 - val / 100.0);
-                    (x, y)
-                }).collect();
-                if let Some(&(x0, y0)) = points.first() {
-                    cr.move_to(x0, y0);
-                    for &(x, y) in &points[1..] { cr.line_to(x, y); }
-                    let _ = cr.stroke();
-                }
-            }
-            cr.set_dash(&[], 0.0);
+            // VRAM capacity % (purple, solid)
+            draw_line(&|i| hist_ref[i].vram_pct, 0.8, 0.4, 1.0, 100.0);
             // Power (cyan, scaled 0-200W → 0-100)
             draw_line(&|i| hist_ref[i].power_w * (100.0 / 200.0), 0.3, 0.8, 1.0, 100.0);
 
@@ -915,28 +865,34 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
                 cr.line_to(pad_l + cw, tgp_y);
                 let _ = cr.stroke();
                 cr.set_dash(&[], 0.0);
-                cr.set_font_size(8.0);
+                cr.set_font_size(fs_axis * 0.85);
                 cr.set_source_rgba(0.3, 0.8, 1.0, 0.7);
                 cr.move_to(pad_l + 2.0, tgp_y - 2.0);
                 let _ = cr.show_text(&format!("TGP {tgp:.0}W"));
             }
 
-            // Legend
-            cr.set_font_size(10.0);
-            let legend = [("Temp", 1.0_f64, 0.6, 0.2), ("GPU%", 0.27, 1.0, 0.63), ("MemBW", 0.8, 0.4, 1.0), ("Power", 0.3, 0.8, 1.0)];
-            let mut lx = pad_l + 4.0;
-            for (label, r, g, b) in &legend {
+            // Legend — each label centered in its equal quarter of the chart
+            cr.set_font_size(fs_legend);
+            let legend = [("Temp", 1.0_f64, 0.6, 0.2), ("GPU%", 0.27, 1.0, 0.63), ("VRAM%", 0.8, 0.4, 1.0), ("Power", 0.3, 0.8, 1.0)];
+            let n_items = legend.len() as f64;
+            let legend_step = cw / n_items;
+            let box_sz = (fs_legend * 0.8).round();
+            for (idx, (label, r, g, b)) in legend.iter().enumerate() {
+                let lx = pad_l + idx as f64 * legend_step + (legend_step - 55.0).max(0.0) * 0.5;
                 cr.set_source_rgb(*r, *g, *b);
-                cr.rectangle(lx, h - 12.0, 8.0, 8.0);
+                cr.rectangle(lx, h - 22.0, box_sz, box_sz);
                 let _ = cr.fill();
-                cr.move_to(lx + 11.0, h - 4.5);
+                cr.move_to(lx + box_sz + 3.0, h - 8.0);
                 let _ = cr.show_text(label);
-                lx += 58.0;
             }
         });
 
         chart_group.add(&chart);
-        page.add(&chart_group);
+        page.add(&chart_group);   // 1. chart is first
+
+        let gpu_group = adw::PreferencesGroup::new();
+        gpu_group.add(&gpu_expander);
+        page.add(&gpu_group);     // 2. GPU info (collapsible, expanded)
 
         // Poll every 3 seconds — update labels + chart
         let hist_poll = history;
@@ -953,7 +909,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
             #[upgrade_or] glib::ControlFlow::Break,
             move || {
                 if let Some(comms::DaemonResponse::GetGpuStatus {
-                    temp_c, gpu_util, mem_util, power_w, power_limit_w,
+                    temp_c, gpu_util, power_w, power_limit_w,
                     mem_used_mb, mem_total_mb, clock_gpu_mhz, clock_mem_mhz, ..
                 }) = send_data(comms::DaemonCommand::GetGpuStatus) {
                     temp_label.set_text(&format!("{temp_c}°C"));
@@ -966,7 +922,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
 
                     *tgp_poll.borrow_mut() = power_limit_w as f64;
                     let mut h = hist_poll.borrow_mut();
-                    h.push_back(Sample { temp_c: temp_c as f64, gpu_pct: gpu_util as f64, mem_bw_pct: mem_util as f64, power_w: power_w as f64 });
+                    h.push_back(Sample { temp_c: temp_c as f64, gpu_pct: gpu_util as f64, vram_pct: if mem_total_mb > 0 { mem_used_mb as f64 * 100.0 / mem_total_mb as f64 } else { 0.0 }, power_w: power_w as f64 });
                     while h.len() > CHART_HISTORY { h.pop_front(); }
                     drop(h);
                     chart_ref.queue_draw();
@@ -974,6 +930,43 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
                 glib::ControlFlow::Continue
             }
         ));
+    }
+
+    // 3. System Information (collapsible, collapsed by default)
+    {
+        let sysinfo_expander = adw::ExpanderRow::builder()
+            .title("System Information")
+            .expanded(false)
+            .build();
+
+        let add_info = |title: &str, value: &str| -> adw::ActionRow {
+            let row = adw::ActionRow::builder().title(title).build();
+            row.add_suffix(&gtk::Label::builder().label(value).css_classes(["monospace"]).build());
+            row
+        };
+
+        sysinfo_expander.add_row(&add_info("Device", &device.name));
+
+        let dmi_product = std::fs::read_to_string("/sys/devices/virtual/dmi/id/product_name")
+            .unwrap_or_default().trim().to_string();
+        let dmi_vendor = std::fs::read_to_string("/sys/devices/virtual/dmi/id/sys_vendor")
+            .unwrap_or_default().trim().to_string();
+        let dmi_bios = std::fs::read_to_string("/sys/devices/virtual/dmi/id/bios_version")
+            .unwrap_or_default().trim().to_string();
+
+        if !dmi_product.is_empty() {
+            let host = if dmi_vendor.is_empty() { dmi_product } else { format!("{dmi_vendor} {dmi_product}") };
+            sysinfo_expander.add_row(&add_info("Host", &host));
+        }
+        sysinfo_expander.add_row(&add_info("USB ID", &format!("{}:{}", device.vid, device.pid)));
+        sysinfo_expander.add_row(&add_info("Features", &device.features.join(", ")));
+        if !dmi_bios.is_empty() { sysinfo_expander.add_row(&add_info("BIOS", &dmi_bios)); }
+        sysinfo_expander.add_row(&add_info("Fan Range", &format!("{} – {} RPM",
+            device.fan.first().unwrap_or(&0), device.fan.get(1).unwrap_or(&0))));
+
+        let sysinfo_group = adw::PreferencesGroup::new();
+        sysinfo_group.add(&sysinfo_expander);
+        page.add(&sysinfo_group);
     }
 
     scroll.set_child(Some(&page));

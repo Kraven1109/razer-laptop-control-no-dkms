@@ -269,31 +269,39 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
                     d.device = None; // drop HidDevice → close fd → USB can suspend
                 }
             } else {
-                // Waking up: USB host re-enumerates devices; retry discovery
-                // for up to ~2 seconds to handle slow controller init.
-                thread::sleep(std::time::Duration::from_millis(500));
-                let mut discovered = false;
-                for attempt in 0..5_u32 {
-                    let has_device = match DEV_MANAGER.lock() {
-                        Ok(mut d) => { d.discover_devices(); d.device.is_some() }
-                        Err(e) => { error!("DEV_MANAGER lock failed on resume: {}", e); break; }
-                    };
-                    if has_device {
-                        info!("HID device ready after resume (attempt {})", attempt + 1);
-                        discovered = true;
-                        break;
+                // Waking up: offload all recovery to a background thread so
+                // the D-Bus dispatch loop returns immediately. If recovery
+                // runs inside this callback it blocks dbus_system.process()
+                // for ~5-7 s; any queued PrepareForSleep(true) then fires
+                // the moment we return, causing an immediate re-suspend.
+                thread::spawn(|| {
+                    // Wait for the NVIDIA display pipeline (PRIME/NVPCF) to
+                    // reinitialise before any HID/EC writes. Early EC traffic
+                    // can prevent the screen coming back after resume.
+                    thread::sleep(std::time::Duration::from_millis(2000));
+                    let mut discovered = false;
+                    for attempt in 0..5_u32 {
+                        let has_device = match DEV_MANAGER.lock() {
+                            Ok(mut d) => { d.discover_devices(); d.device.is_some() }
+                            Err(e) => { error!("DEV_MANAGER lock failed on resume: {}", e); break; }
+                        };
+                        if has_device {
+                            info!("HID device ready after resume (attempt {})", attempt + 1);
+                            discovered = true;
+                            break;
+                        }
+                        warn!("HID device not ready on resume attempt {}, retrying in 300 ms", attempt + 1);
+                        thread::sleep(std::time::Duration::from_millis(300));
                     }
-                    warn!("HID device not ready on resume attempt {}, retrying in 300 ms", attempt + 1);
-                    thread::sleep(std::time::Duration::from_millis(300));
-                }
-                if !discovered {
-                    warn!("HID device unavailable after 5 attempts; backlight will remain off");
-                }
-                if let Ok(mut d) = DEV_MANAGER.lock() {
-                    d.set_ac_state_get();
-                    if discovered { d.restore_light(); }
-                }
-                SYSTEM_SLEEPING.store(false, Ordering::SeqCst);
+                    if !discovered {
+                        warn!("HID device unavailable after 5 attempts; backlight will remain off");
+                    }
+                    if let Ok(mut d) = DEV_MANAGER.lock() {
+                        d.set_ac_state_get();
+                        if discovered { d.restore_light(); }
+                    }
+                    SYSTEM_SLEEPING.store(false, Ordering::SeqCst);
+                });
             }
             true
         });
@@ -352,12 +360,13 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                 // Pin GPU TGP to a stable value matching the power mode, preventing
                 // Dynamic Boost oscillation that causes display flickering.
                 // EC sets hardware TGP; nvidia-smi SW cap provides a stable software ceiling.
+                // Profile indices: 0=Balanced, 1=Gaming, 2=Creator, 3=Silent, 4=Custom
                 let tgp: u32 = match pwr {
-                    0 => 50,   // Silent
-                    1 => 115,  // Balanced
-                    2 => 150,  // Gaming
-                    3 => 115,  // Creator
-                    _ => 115,
+                    0 => 115,  // Balanced
+                    1 => 150,  // Gaming
+                    2 => 115,  // Creator
+                    3 => 50,   // Silent
+                    _ => 115,  // Custom / unknown
                 };
                 pin_nvidia_tgp(tgp);
                 Some(comms::DaemonResponse::SetPowerMode { result: ok })
