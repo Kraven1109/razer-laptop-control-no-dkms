@@ -40,7 +40,10 @@ pub struct GpuStatus {
 pub fn query_nvidia_gpu() -> Option<GpuStatus> {
     let output = Command::new("nvidia-smi")
         .args([
-            "--query-gpu=name,temperature.gpu,utilization.gpu,utilization.memory,power.draw,power.default_limit,memory.used,memory.total,clocks.gr,clocks.mem",
+            // enforced.power.limit reflects the actual firmware-set TGP (e.g. 135W in
+            // Balanced, 150W in Gaming).  power.default_limit is a static factory value
+            // (115W on this GPU) that never changes — don't use it for the live chart.
+            "--query-gpu=name,temperature.gpu,utilization.gpu,utilization.memory,power.draw,enforced.power.limit,memory.used,memory.total,clocks.gr,clocks.mem",
             "--format=csv,noheader,nounits",
         ])
         .output()

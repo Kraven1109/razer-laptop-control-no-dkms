@@ -162,7 +162,9 @@ pub fn start_keyboard_animator_task() -> JoinHandle<()> {
 pub fn start_gpu_load_monitor_task() -> JoinHandle<()> {
     thread::spawn(|| {
         loop {
-            thread::sleep(std::time::Duration::from_secs(5));
+            // 3 s matches the GUI chart poll rate — prevents the chart from
+            // displaying the same sample twice before the cache refreshes.
+            thread::sleep(std::time::Duration::from_secs(3));
             // Skip GPU polling while system is suspended — avoids waking the
             // NVIDIA GPU out of D3cold and prevents stale nvidia-smi calls.
             if SYSTEM_SLEEPING.load(Ordering::Relaxed) {
@@ -357,18 +359,14 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
         return match cmd {
             comms::DaemonCommand::SetPowerMode { ac, pwr, cpu, gpu } => {
                 let ok = d.set_power_mode(ac, pwr, cpu, gpu);
-                // Pin GPU TGP to a stable value matching the power mode, preventing
-                // Dynamic Boost oscillation that causes display flickering.
-                // EC sets hardware TGP; nvidia-smi SW cap provides a stable software ceiling.
-                // Profile indices: 0=Balanced, 1=Gaming, 2=Creator, 3=Silent, 4=Custom
-                let tgp: u32 = match pwr {
-                    0 => 115,  // Balanced
-                    1 => 150,  // Gaming
-                    2 => 115,  // Creator
-                    3 => 50,   // Silent
-                    _ => 115,  // Custom / unknown
-                };
-                pin_nvidia_tgp(tgp);
+                // Verify the EC actually applied the mode — if HID write fails,
+                // the readback will differ from what we sent.
+                let confirmed = d.get_power_mode(ac);
+                if confirmed == pwr {
+                    info!("Power mode set OK (pwr={} cpu={} gpu={} ac={})", pwr, cpu, gpu, ac);
+                } else {
+                    warn!("Power mode mismatch: sent {} but EC reports {} (HID write may have failed)", pwr, confirmed);
+                }
                 Some(comms::DaemonResponse::SetPowerMode { result: ok })
             },
             comms::DaemonCommand::SetFanSpeed { ac, rpm } => {
@@ -547,23 +545,4 @@ fn read_rapl_uw(path: &str) -> u64 {
 
 fn write_rapl_uw(path: &str, value: u64) -> bool {
     std::fs::write(path, value.to_string()).is_ok()
-}
-
-/// Pin the NVIDIA GPU software power cap to a stable wattage.
-/// This prevents Dynamic Boost 2.0 from oscillating the TGP under load,
-/// which on PRIME/Optimus configurations (like Blade 16 2023) causes the
-/// NVIDIA GSP firmware↔EC power negotiation loop to emit rapid TGP changes
-/// that stall the PRIME frame pipeline and appear as display flickering.
-///
-/// Uses persistence mode so the cap survives until next daemon restart.
-/// The cap is re-applied on every power-mode switch.
-fn pin_nvidia_tgp(watts: u32) {
-    // Ensure persistence mode first (required for -pl to persist)
-    let _ = std::process::Command::new("nvidia-smi")
-        .args(["-pm", "1"])
-        .output();
-    let _ = std::process::Command::new("nvidia-smi")
-        .args(["-pl", &watts.to_string()])
-        .output();
-    info!("Pinned GPU TGP to {}W", watts);
 }
