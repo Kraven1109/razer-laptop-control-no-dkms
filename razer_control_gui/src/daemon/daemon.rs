@@ -161,9 +161,15 @@ pub fn start_keyboard_animator_task() -> JoinHandle<()> {
                     }
                 }
             }
-            thread::sleep(std::time::Duration::from_millis(
-                ANIM_SLEEP_MS.load(Ordering::Relaxed)
-            ));
+            // Cap sleep at 200 ms so the animator notices when ANIM_SLEEP_MS
+            // is reset to normal (100 ms) after the flicker guard releases.
+            // Without this cap the thread sleeps for 600 000 ms (the guard
+            // value) and the keyboard stays frozen for up to 10 minutes after
+            // inference ends even though the guard has already been cleared.
+            // 200 ms cap: still 0 HID writes during guard (checked above), but
+            // the thread wakes and picks up the new sleep value within 200 ms.
+            let sleep_ms = ANIM_SLEEP_MS.load(Ordering::Relaxed).min(200);
+            thread::sleep(std::time::Duration::from_millis(sleep_ms));
         }
     })
 }
@@ -186,7 +192,21 @@ pub fn start_gpu_load_monitor_task() -> JoinHandle<()> {
     thread::spawn(|| {
         loop {
             let on_ac = gpu_monitor_on_ac();
-            let poll_secs = if on_ac { 3 } else { 10 };
+            // When the flicker guard is armed, extend the nvidia-smi poll from
+            // 3 s to 30 s.  nvidia-smi spawning briefly acquires a driver-level
+            // lock that blocks the PRIME DMA completion fence; with the guard
+            // active the i915 pageflip was seeing 1368 ms timeouts every 3 s
+            // (confirmed in kwin_wayland journal).  The guard min-hold (20 s)
+            // keeps the keyboard frozen without any new data during this window;
+            // after 30 s one nvidia-smi runs to check whether the GPU has
+            // actually gone idle and the guard should release.
+            let poll_secs = if HIGH_POWER_FLICKER_GUARD.load(Ordering::Relaxed) {
+                30
+            } else if on_ac {
+                3
+            } else {
+                10
+            };
             thread::sleep(std::time::Duration::from_secs(poll_secs));
             // Skip GPU polling while system is suspended — avoids waking the
             // NVIDIA GPU out of D3cold and prevents stale nvidia-smi calls.
