@@ -130,6 +130,7 @@ pub struct EffectManager {
     layers: Vec<EffectLayer>,
     last_update_ms: u128,
     render_board: board::KeyboardData,
+    last_sent_rows: Option<[board::RowData; board::ROWS]>,
 }
 
 unsafe impl Send for EffectManager {}
@@ -141,6 +142,7 @@ impl EffectManager {
             layers: vec![],
             last_update_ms: get_millis(),
             render_board: board::KeyboardData::new(),
+            last_sent_rows: None,
         }
     }
 
@@ -153,8 +155,9 @@ impl EffectManager {
         // If no more layers, erase keyboard rendering and set it to black
         if self.layers.is_empty() {
             self.render_board.set_kbd_colour(0, 0, 0); 
-            self.render_board.update_kbd(laptop);
-            self.render_board.update_custom_mode(laptop);
+            if self.render_board.update_kbd(laptop, &mut self.last_sent_rows) {
+                self.render_board.update_custom_mode(laptop);
+            }
         }
     }
 
@@ -173,8 +176,9 @@ impl EffectManager {
         }
         // Don't forget to actually render the board
         self.last_update_ms = get_millis();
-        self.render_board.update_kbd(laptop);
-        self.render_board.update_custom_mode(laptop);
+        if self.render_board.update_kbd(laptop, &mut self.last_sent_rows) {
+            self.render_board.update_custom_mode(laptop);
+        }
     }
 
     pub fn save(&mut self) -> serde_json::value::Value {
@@ -214,5 +218,14 @@ impl EffectManager {
         } else {
             return self.layers[layer_id as usize].get_state();
         }
+    }
+
+    /// Returns the name and raw args of the topmost active effect layer,
+    /// or None if no effect is currently loaded (keyboard is off).
+    pub fn get_current_effect_info(&mut self) -> Option<(String, Vec<u8>)> {
+        self.layers.last_mut().map(|layer| {
+            let save = layer.effect.save();
+            (save.name, save.args)
+        })
     }
 }

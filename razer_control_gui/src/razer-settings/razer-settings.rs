@@ -161,6 +161,15 @@ fn set_power_limits(pl1: u32, pl2: u32) -> Option<bool> {
     }
 }
 
+/// Returns (effect_name, args) for the currently active keyboard effect,
+/// or None if no effect is running (keyboard is off / daemon has no effect).
+fn get_current_effect() -> Option<(String, Vec<u8>)> {
+    match send_data(comms::DaemonCommand::GetCurrentEffect)? {
+        comms::DaemonResponse::GetCurrentEffect { name, args } if !name.is_empty() => Some((name, args)),
+        _ => None,
+    }
+}
+
 // ── Main Application Model ───────────────────────────────────────────────
 
 struct App {
@@ -405,18 +414,46 @@ fn build_power_page(ac: bool, device: &SupportedDevice) -> gtk::ScrolledWindow {
     {
         let group = adw::PreferencesGroup::builder().title("Keyboard Brightness").build();
         let brightness = get_brightness(ac).unwrap_or(50);
+        let syncing = Rc::new(RefCell::new(false));
 
         let spin_row = adw::SpinRow::with_range(0.0, 100.0, 1.0);
         spin_row.set_title("Brightness");
         spin_row.set_subtitle("Keyboard backlight intensity");
         spin_row.set_value(brightness as f64);
 
+        let syncing_write = syncing.clone();
         spin_row.connect_value_notify(move |row| {
+            if *syncing_write.borrow() {
+                return;
+            }
             let val = row.value().clamp(0.0, 100.0) as u8;
             set_brightness(ac, val);
             let readback = get_brightness(ac).unwrap_or(val);
-            row.set_value(readback as f64);
+            if readback != val {
+                *syncing_write.borrow_mut() = true;
+                row.set_value(readback as f64);
+                *syncing_write.borrow_mut() = false;
+            }
         });
+
+        let syncing_poll = syncing.clone();
+        glib::timeout_add_seconds_local(2, glib::clone!(
+            #[weak] spin_row,
+            #[upgrade_or] glib::ControlFlow::Break,
+            move || {
+                if check_if_running_on_ac_power() == Some(ac) {
+                    if let Some(readback) = get_brightness(ac) {
+                        let current = spin_row.value().round().clamp(0.0, 100.0) as u8;
+                        if current != readback {
+                            *syncing_poll.borrow_mut() = true;
+                            spin_row.set_value(readback as f64);
+                            *syncing_poll.borrow_mut() = false;
+                        }
+                    }
+                }
+                glib::ControlFlow::Continue
+            }
+        ));
 
         group.add(&spin_row);
         page.add(&group);
@@ -498,7 +535,6 @@ fn build_keyboard_page() -> gtk::ScrolledWindow {
         .subtitle("Keyboard lighting effect")
         .build();
     effect_row.set_model(Some(&gtk::StringList::new(&effect_names)));
-    effect_row.set_selected(0);
 
     let desc_label = gtk::Label::builder()
         .label("Set a single color across all keys")
@@ -506,10 +542,65 @@ fn build_keyboard_page() -> gtk::ScrolledWindow {
         .css_classes(["effect-description"])
         .build();
 
+    // ── Restore state from daemon's current effect ─────────────────────
+    // Query once at page-build time so the UI reflects the running effect
+    // rather than always defaulting to "Static / green".
+    struct EffectInit {
+        idx: u32,
+        r1: u8, g1: u8, b1: u8,
+        r2: u8, g2: u8, b2: u8,
+        speed: u8,
+        dir: u32,
+        density: u8,
+        duration: u8,
+    }
+    let ei: EffectInit = get_current_effect()
+        .and_then(|(name, args)| {
+            let idx = match name.as_str() {
+                "Static"          => 0u32,
+                "Static Gradient" => 1,
+                "Wave Gradient"   => 2,
+                "Breathing Single"=> 3,
+                "Breathing Dual"  => 4,
+                "Spectrum Cycle"  => 5,
+                "Rainbow Wave"    => 6,
+                "Starlight"       => 7,
+                "Ripple"          => 8,
+                "Wheel"           => 9,
+                _ => return None,
+            };
+            let a = |i: usize| args.get(i).copied().unwrap_or(0u8);
+            let (r1, g1, b1) = (a(0), a(1), a(2));
+            let (r2, g2, b2) = if matches!(idx, 1 | 2 | 4) { (a(3), a(4), a(5)) }
+                               else { (0, 128, 255) };
+            let speed = match idx {
+                5 => a(0).max(1),           // Spectrum Cycle: [speed]
+                6 => a(0).max(1),           // Rainbow Wave:   [speed, dir]
+                8 => a(3).max(1),           // Ripple:         [R,G,B, speed]
+                9 => a(0).max(1),           // Wheel:          [speed, dir]
+                _ => 5,
+            };
+            let dir = if matches!(idx, 6 | 9) { a(1) as u32 } else { 0 };
+            let density = if idx == 7 { a(3).max(1) } else { 10 };
+            let duration = match idx {
+                3 => a(3).max(1),   // Breathing Single: [R,G,B, duration]
+                4 => a(6).max(1),   // Breathing Dual:   [R1,G1,B1,R2,G2,B2, duration]
+                _ => 10,
+            };
+            Some(EffectInit { idx, r1, g1, b1, r2, g2, b2, speed, dir, density, duration })
+        })
+        .unwrap_or(EffectInit {
+            idx: 0, r1: 0, g1: 255, b1: 0, r2: 0, g2: 128, b2: 255,
+            speed: 5, dir: 0, density: 10, duration: 10,
+        });
+
+    effect_row.set_selected(ei.idx);
+
     // Color wheels
     let wheel1 = ColorWheel::new(160);
     let wheel2 = ColorWheel::new(160);
-    wheel2.set_rgb(0, 128, 255);
+    wheel1.set_rgb(ei.r1, ei.g1, ei.b1);
+    wheel2.set_rgb(ei.r2, ei.g2, ei.b2);
 
     let wheel1_frame = gtk::Frame::builder()
         .label("Primary Color")
@@ -539,24 +630,24 @@ fn build_keyboard_page() -> gtk::ScrolledWindow {
     let speed_row = adw::SpinRow::with_range(1.0, 10.0, 1.0);
     speed_row.set_title("Speed");
     speed_row.set_subtitle("Animation speed");
-    speed_row.set_value(5.0);
+    speed_row.set_value(ei.speed as f64);
 
     let direction_row = adw::ComboRow::builder()
         .title("Direction")
         .subtitle("Wave direction")
         .build();
     direction_row.set_model(Some(&gtk::StringList::new(&["Left → Right", "Right → Left"])));
-    direction_row.set_selected(0);
+    direction_row.set_selected(ei.dir);
 
     let density_row = adw::SpinRow::with_range(1.0, 20.0, 1.0);
     density_row.set_title("Density");
     density_row.set_subtitle("Star density");
-    density_row.set_value(10.0);
+    density_row.set_value(ei.density as f64);
 
     let duration_row = adw::SpinRow::with_range(1.0, 20.0, 1.0);
     duration_row.set_title("Duration");
     duration_row.set_subtitle("Breath cycle length");
-    duration_row.set_value(10.0);
+    duration_row.set_value(ei.duration as f64);
 
     // Apply button
     let apply_btn = gtk::Button::builder()
@@ -599,7 +690,7 @@ fn build_keyboard_page() -> gtk::ScrolledWindow {
         }
     };
 
-    update_visibility(0);
+    update_visibility(ei.idx);
 
     effect_row.connect_selected_notify({
         let update = update_visibility.clone();
@@ -709,7 +800,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
     let page = adw::PreferencesPage::new();
 
     if let Some(comms::DaemonResponse::GetGpuStatus {
-        name, temp_c, gpu_util, power_w, power_limit_w,
+        name, temp_c, gpu_util, power_w, power_limit_w, power_max_limit_w,
         mem_used_mb, mem_total_mb, clock_gpu_mhz, clock_mem_mhz, ..
     }) = send_data(comms::DaemonCommand::GetGpuStatus) {
         let gpu_expander = adw::ExpanderRow::builder()
@@ -723,7 +814,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
         let mem_pct = if mem_total_mb > 0 { mem_used_mb * 100 / mem_total_mb } else { 0 };
         let vram_label = gtk::Label::builder().label(&format!("{mem_used_mb}/{mem_total_mb} MiB ({mem_pct}%)")).css_classes(["monospace"]).build();
         let power_label = gtk::Label::builder().label(&format!("{power_w:.1} W")).css_classes(["monospace"]).build();
-        let tgp_label = gtk::Label::builder().label(&format!("{power_limit_w:.0} W (default)")).css_classes(["monospace"]).build();
+        let tgp_label = gtk::Label::builder().label(&format!("{power_limit_w:.0} W enforced / {power_max_limit_w:.0} W max")).css_classes(["monospace"]).build();
         let clock_label = gtk::Label::builder().label(&format!("GPU {clock_gpu_mhz} / Mem {clock_mem_mhz} MHz")).css_classes(["monospace"]).build();
 
         let make_row = |title: &str, suffix: &gtk::Label| -> adw::ActionRow {
@@ -768,9 +859,12 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
         chart.set_margin_end(12);
         chart.set_margin_bottom(8);
 
-        let hist_draw = history.clone();
-        let tgp_draw = tgp_limit.clone();
-        chart.set_draw_func(move |_da, cr, w, h| {
+        // Wrap the chart draw function in an Rc<dyn Fn> so it can be shared
+        // between the embedded chart and any pop-out floating monitor windows.
+        let draw_fn: Rc<dyn Fn(&gtk::DrawingArea, &gtk::cairo::Context, i32, i32)> = Rc::new({
+            let hist_draw = history.clone();
+            let tgp_draw = tgp_limit.clone();
+            move |_da, cr: &gtk::cairo::Context, w: i32, h: i32| {
             let w = w as f64;
             let h = h as f64;
             let hist = hist_draw.borrow();
@@ -885,9 +979,164 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
                 cr.move_to(lx + box_sz + 3.0, h - 8.0);
                 let _ = cr.show_text(label);
             }
+        }});
+
+        let draw_fn_c = draw_fn.clone();
+        chart.set_draw_func(move |da, cr, w, h| draw_fn_c(da, cr, w, h));
+
+        // CSV log file handle — None when logging is off, Some(file) when on.
+        // Shared between the toggle button handler and the 3-s poll timer below.
+        let csv_log: Rc<RefCell<Option<std::fs::File>>> = Rc::new(RefCell::new(None));
+
+        // Bottom button row: [Log CSV]  ·  ·  ·  [Pop Out]
+        let btn_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .margin_start(4)
+            .margin_end(4)
+            .margin_bottom(4)
+            .build();
+
+        let log_btn = gtk::ToggleButton::builder()
+            .label("Log CSV")
+            .icon_name("document-save-symbolic")
+            .css_classes(["flat"])
+            .tooltip_text("Log GPU metrics to ~/.local/share/razer-control/gpu_monitor.csv")
+            .build();
+        let csv_log_toggle = csv_log.clone();
+        log_btn.connect_toggled(move |btn| {
+            let mut guard = csv_log_toggle.borrow_mut();
+            if btn.is_active() {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                let log_dir = std::path::Path::new(&home).join(".local/share/razer-control");
+                let _ = std::fs::create_dir_all(&log_dir);
+                let log_path = log_dir.join("gpu_monitor.csv");
+                let file_exists = log_path.exists();
+                if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                    if !file_exists {
+                        use std::io::Write;
+                        let mut fw = &f;
+                        let _ = writeln!(fw, "timestamp,power_limit_w,power_w,gpu_util,vram_pct,temp_c");
+                    }
+                    *guard = Some(f);
+                    btn.set_tooltip_text(Some(&format!("Logging → {}", log_path.display())));
+                } else {
+                    btn.set_active(false);
+                }
+            } else {
+                *guard = None;
+                btn.set_tooltip_text(Some("Log GPU metrics to ~/.local/share/razer-control/gpu_monitor.csv"));
+            }
         });
+        btn_row.append(&log_btn);
+
+        // Spacer between left and right buttons
+        let spacer = gtk::Box::builder().hexpand(true).build();
+        btn_row.append(&spacer);
+
+        // "Pop Out" button — opens a floating GPU monitor window.
+        // The floating chart shares the same history/tgp_limit Rc data as the
+        // embedded chart, so both update in lock-step from the 3-second poll timer.
+        let popout_btn = gtk::Button::builder()
+            .label("Pop Out")
+            .icon_name("window-new-symbolic")
+            .css_classes(["flat"])
+            .build();
+        // Use a WeakRef to the main chart so the popout closure can hide/show it
+        // without preventing chart from being properly destroyed with the main window.
+        let chart_wr = chart.downgrade();
+        let draw_fn_popup = draw_fn.clone();
+        popout_btn.connect_clicked(glib::clone!(
+            #[weak] popout_btn,
+            #[upgrade_or] (),
+            move |_| {
+                // Hide main chart — no duplicate rendering while popped out.
+                let Some(chart_main) = chart_wr.upgrade() else { return };
+                chart_main.set_visible(false);
+                popout_btn.set_sensitive(false);
+
+                let float_win = gtk::Window::builder()
+                    .title("GPU Monitor — Razer Blade")
+                    .default_width(700)
+                    .default_height(380)
+                    .resizable(true)
+                    .build();
+
+                let float_chart = gtk::DrawingArea::new();
+                float_chart.set_size_request(-1, 340);
+                float_chart.set_margin_start(12);
+                float_chart.set_margin_end(12);
+                float_chart.set_margin_top(4);
+                float_chart.set_margin_bottom(4);
+                float_chart.set_vexpand(true);
+
+                let draw_fn_c = draw_fn_popup.clone();
+                float_chart.set_draw_func(move |da, cr, w, h| draw_fn_c(da, cr, w, h));
+
+                // Refresh floating chart every 3 s — main poll timer already updates
+                // the shared history Rc, so this only needs queue_draw().
+                glib::timeout_add_seconds_local(3, glib::clone!(
+                    #[weak] float_chart,
+                    #[upgrade_or] glib::ControlFlow::Break,
+                    move || {
+                        float_chart.queue_draw();
+                        glib::ControlFlow::Continue
+                    }
+                ));
+
+                // Restore main chart when the floating window is closed.
+                let chart_wr_c = chart_wr.clone();
+                float_win.connect_destroy(glib::clone!(
+                    #[weak] popout_btn,
+                    #[upgrade_or] (),
+                    move |_| {
+                        if let Some(c) = chart_wr_c.upgrade() { c.set_visible(true); }
+                        popout_btn.set_sensitive(true);
+                    }
+                ));
+
+                float_win.set_child(Some(&float_chart));
+                float_win.present();
+
+                // Auto-pin on top via KWin scripting (KDE Plasma 5 & 6).
+                // Matches by PID (more reliable than window title).
+                // Delayed 800 ms so the window is fully mapped in the compositor first.
+                let pid = std::process::id();
+                glib::timeout_add_local(
+                    std::time::Duration::from_millis(800),
+                    move || {
+                        let script = format!(
+                            r#"var pid={pid};var wins=typeof workspace.windows!=="undefined"?workspace.windows:(workspace.windowList?workspace.windowList():[]);for(var i=0;i<wins.length;i++){{if(wins[i]&&wins[i].pid===pid){{wins[i].keepAbove=true;}}}}"
+                            "#
+                        );
+                        let tmp = std::path::Path::new("/tmp/razer-kwin-pin.js");
+                        if std::fs::write(tmp, script.trim()).is_ok() {
+                            // Unload any stale copy first so start() won't run
+                            // the old script alongside the new one.
+                            let _ = std::process::Command::new("qdbus6")
+                                .args(["org.kde.KWin", "/Scripting",
+                                       "org.kde.kwin.Scripting.unloadScript",
+                                       "razer-pin"])
+                                .status();
+                            let _ = std::process::Command::new("qdbus6")
+                                .args(["org.kde.KWin", "/Scripting",
+                                       "org.kde.kwin.Scripting.loadScript",
+                                       "/tmp/razer-kwin-pin.js", "razer-pin"])
+                                .status();
+                            let _ = std::process::Command::new("qdbus6")
+                                .args(["org.kde.KWin", "/Scripting",
+                                       "org.kde.kwin.Scripting.start"])
+                                .status();
+                            let _ = std::fs::remove_file(tmp);
+                        }
+                        glib::ControlFlow::Break
+                    },
+                );
+            }
+        ));
+        btn_row.append(&popout_btn);
 
         chart_group.add(&chart);
+        chart_group.add(&btn_row);
         page.add(&chart_group);   // 1. chart is first
 
         let gpu_group = adw::PreferencesGroup::new();
@@ -898,6 +1147,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
         let hist_poll = history;
         let tgp_poll = tgp_limit;
         let chart_ref = chart;
+        let csv_poll = csv_log;
         glib::timeout_add_seconds_local(3, glib::clone!(
             #[weak] temp_label,
             #[weak] usage_label,
@@ -909,7 +1159,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
             #[upgrade_or] glib::ControlFlow::Break,
             move || {
                 if let Some(comms::DaemonResponse::GetGpuStatus {
-                    temp_c, gpu_util, power_w, power_limit_w,
+                    temp_c, gpu_util, power_w, power_limit_w, power_max_limit_w,
                     mem_used_mb, mem_total_mb, clock_gpu_mhz, clock_mem_mhz, ..
                 }) = send_data(comms::DaemonCommand::GetGpuStatus) {
                     temp_label.set_text(&format!("{temp_c}°C"));
@@ -917,14 +1167,31 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
                     let mem_pct = if mem_total_mb > 0 { mem_used_mb * 100 / mem_total_mb } else { 0 };
                     vram_label.set_text(&format!("{mem_used_mb}/{mem_total_mb} MiB ({mem_pct}%)"));
                     power_label.set_text(&format!("{power_w:.1} W"));
-                    tgp_label.set_text(&format!("{power_limit_w:.0} W (default)"));
+                    tgp_label.set_text(&format!("{power_limit_w:.0} W enforced / {power_max_limit_w:.0} W max"));
                     clock_label.set_text(&format!("GPU {clock_gpu_mhz} / Mem {clock_mem_mhz} MHz"));
 
                     *tgp_poll.borrow_mut() = power_limit_w as f64;
-                    let mut h = hist_poll.borrow_mut();
-                    h.push_back(Sample { temp_c: temp_c as f64, gpu_pct: gpu_util as f64, vram_pct: if mem_total_mb > 0 { mem_used_mb as f64 * 100.0 / mem_total_mb as f64 } else { 0.0 }, power_w: power_w as f64 });
-                    while h.len() > CHART_HISTORY { h.pop_front(); }
-                    drop(h);
+                    let sample = Sample {
+                        temp_c: temp_c as f64,
+                        gpu_pct: gpu_util as f64,
+                        vram_pct: if mem_total_mb > 0 { mem_used_mb as f64 * 100.0 / mem_total_mb as f64 } else { 0.0 },
+                        power_w: power_w as f64,
+                    };
+                    {
+                        let mut h = hist_poll.borrow_mut();
+                        h.push_back(sample);
+                        while h.len() > CHART_HISTORY { h.pop_front(); }
+                    }
+                    // Append to CSV log if logging is enabled
+                    if let Some(ref mut f) = *csv_poll.borrow_mut() {
+                        use std::io::Write;
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let _ = writeln!(f, "{ts},{power_limit_w:.1},{power_w:.1},{gpu_util},{:.1},{temp_c}",
+                            sample.vram_pct);
+                    }
                     chart_ref.queue_draw();
                 }
                 glib::ControlFlow::Continue

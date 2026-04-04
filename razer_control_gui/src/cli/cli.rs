@@ -835,14 +835,14 @@ fn write_sync(sync: bool) {
 fn read_gpu_status() {
     match send_data(comms::DaemonCommand::GetGpuStatus) {
         Some(comms::DaemonResponse::GetGpuStatus {
-            name, temp_c, gpu_util, mem_util, power_w, power_limit_w,
+            name, temp_c, gpu_util, mem_util, power_w, power_limit_w, power_max_limit_w,
             mem_used_mb, mem_total_mb, clock_gpu_mhz, clock_mem_mhz
         }) => {
             println!("GPU:         {}", name);
             println!("Temperature: {}°C", temp_c);
             println!("GPU Usage:   {}%", gpu_util);
             println!("VRAM Usage:  {}% ({} / {} MiB)", mem_util, mem_used_mb, mem_total_mb);
-            println!("Power Draw:  {:.1} W  (TGP default: {:.0} W)", power_w, power_limit_w);
+            println!("Power Draw:  {:.1} W  (TGP enforced: {:.0} W / max: {:.0} W)", power_w, power_limit_w, power_max_limit_w);
             println!("GPU Clock:   {} MHz", clock_gpu_mhz);
             println!("Mem Clock:   {} MHz", clock_mem_mhz);
         },

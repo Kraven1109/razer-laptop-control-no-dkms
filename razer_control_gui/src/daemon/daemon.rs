@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Mutex};
+use std::sync::{atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time;
 
@@ -36,6 +36,20 @@ lazy_static! {
     /// mitigating EC interrupt contention with NVPCF Dynamic Boost
     /// that causes PRIME pipeline stalls (display flicker).
     static ref ANIM_SLEEP_MS: AtomicU64 = AtomicU64::new(kbd::ANIMATION_SLEEP_MS);
+    /// When the GPU is operating very close to its enforced TGP, freeze keyboard
+    /// animation updates entirely. This is a stronger mitigation for the built-in
+    /// panel flicker seen on PRIME/Optimus laptops when EC traffic and NVIDIA's
+    /// Dynamic Boost negotiation overlap under peak load.
+    static ref HIGH_POWER_FLICKER_GUARD: AtomicBool = AtomicBool::new(false);
+    /// Unix-epoch milliseconds when the flicker guard last transitioned to true.
+    /// Used to enforce a minimum hold period so that brief idle gaps between
+    /// ComfyUI/game inference bursts do not prematurely release the guard.
+    static ref GUARD_ENTERED_MS: AtomicU64 = AtomicU64::new(0);
+    /// TGP (enforced.power.limit, in whole watts) recorded at the moment the
+    /// flicker guard was last enabled.  Used as a stable low-water reference
+    /// for the stay condition: Dynamic Boost can raise TGP mid-guard, which
+    /// would otherwise lift the stay threshold and cause spurious early releases.
+    static ref GUARD_ENTRY_TGP: AtomicU32 = AtomicU32::new(0);
     /// Set to true while the system is suspended so GPU polling and HID
     /// writes are suppressed until the device is re-opened after resume.
     static ref SYSTEM_SLEEPING: AtomicBool = AtomicBool::new(false);
@@ -140,7 +154,7 @@ pub fn start_keyboard_animator_task() -> JoinHandle<()> {
         loop {
             // Skip USB writes entirely while device is suspended — the HID fd
             // is closed during sleep and writes would fail or spin-wait.
-            if !SYSTEM_SLEEPING.load(Ordering::Relaxed) {
+            if !SYSTEM_SLEEPING.load(Ordering::Relaxed) && !HIGH_POWER_FLICKER_GUARD.load(Ordering::Relaxed) {
                 if let (Ok(mut dev), Ok(mut fx)) = (DEV_MANAGER.lock(), EFFECT_MANAGER.lock()) {
                     if let Some(laptop) = dev.get_device() {
                         fx.update(laptop);
@@ -154,28 +168,108 @@ pub fn start_keyboard_animator_task() -> JoinHandle<()> {
     })
 }
 
+fn gpu_monitor_on_ac() -> bool {
+    DEV_MANAGER.lock()
+        .ok()
+        .and_then(|mut d| d.get_device().map(|laptop| laptop.get_ac_state() == 1))
+        .unwrap_or(true)
+}
+
 /// Monitors GPU utilization and dynamically adjusts keyboard animation rate.
 /// Under heavy GPU load (>70%), animation is slowed to 3 FPS to reduce EC USB
 /// HID traffic, lowering EC interrupt load during NVIDIA NVPCF Dynamic Boost
 /// negotiations. This mitigates PRIME display pipeline stalls that appear as
-/// display flickering on the built-in panel.
+/// display flickering on the built-in panel. When GPU draw gets very close to
+/// the enforced TGP, the keyboard animation is frozen completely until the GPU
+/// drops back below a lower release threshold.
 pub fn start_gpu_load_monitor_task() -> JoinHandle<()> {
     thread::spawn(|| {
         loop {
-            // 3 s matches the GUI chart poll rate — prevents the chart from
-            // displaying the same sample twice before the cache refreshes.
-            thread::sleep(std::time::Duration::from_secs(3));
+            let on_ac = gpu_monitor_on_ac();
+            let poll_secs = if on_ac { 3 } else { 10 };
+            thread::sleep(std::time::Duration::from_secs(poll_secs));
             // Skip GPU polling while system is suspended — avoids waking the
             // NVIDIA GPU out of D3cold and prevents stale nvidia-smi calls.
             if SYSTEM_SLEEPING.load(Ordering::Relaxed) {
                 continue;
             }
+            // On battery, do not spawn nvidia-smi if the kernel has already
+            // runtime-suspended the dGPU. Re-waking it every few seconds keeps
+            // PRIME active and can manifest as light panel flicker after resume.
+            if !gpu::should_query_nvidia(on_ac) {
+                HIGH_POWER_FLICKER_GUARD.store(false, Ordering::Relaxed);
+                ANIM_SLEEP_MS.store(kbd::ANIMATION_SLEEP_MS, Ordering::Relaxed);
+                gpu::clear_gpu_cache();
+                continue;
+            }
             if let Some(status) = gpu::query_nvidia_gpu() {
                 // Populate the GPU status cache so GetGpuStatus requests from
                 // the GUI are served without spawning additional nvidia-smi
-                // processes — one nvidia-smi every 5 s is enough.
+                // processes — one nvidia-smi every 3 s on AC or 10 s on
+                // battery is enough.
                 gpu::store_gpu_cache(&status);
-                let new_sleep = if status.gpu_util >= 70 {
+
+                let prev_guard = HIGH_POWER_FLICKER_GUARD.load(Ordering::Relaxed);
+                // Use TGP-relative thresholds so the guard fires in every profile
+                // (Silent=115 W, Balanced=135 W, Gaming=150 W, etc.) when the GPU
+                // is operating near its enforced TGP.  The absolute guard previously
+                // used (>= 140 W) never triggered in Silent or Balanced modes where
+                // EC/NVPCF contention can also cause display glitches under load.
+                let tgp = status.power_limit_w;
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                // Minimum hold: once armed, keep the guard active for at least
+                // GUARD_MIN_HOLD_MS regardless of power drops.  This prevents
+                // oscillation during workloads (e.g. ComfyUI inference) where
+                // the GPU briefly idles between compute bursts and power drops
+                // below the stay threshold for only a few seconds.
+                const GUARD_MIN_HOLD_MS: u64 = 20_000;
+                let guard_held_ms = now_ms.saturating_sub(GUARD_ENTERED_MS.load(Ordering::Relaxed));
+                let high_power_guard = if tgp <= 0.0 {
+                    false // No TGP data — don't guard
+                } else if prev_guard && guard_held_ms < GUARD_MIN_HOLD_MS {
+                    // Inside minimum hold window — stay armed unconditionally
+                    true
+                } else if prev_guard {
+                    // Hysteresis after min-hold: use the TGP recorded when the guard
+                    // entered as reference, so a Dynamic-Boost ceiling increase does not
+                    // spuriously raise the stay threshold and release the guard.
+                    let entry_tgp = GUARD_ENTRY_TGP.load(Ordering::Relaxed) as f32;
+                    let ref_tgp = entry_tgp.max(0.0);
+                    status.gpu_util >= 40
+                        && status.power_w >= ref_tgp * 0.88
+                } else {
+                    // Enter guard when drawing ≥ 82% of enforced TGP at ≥ 60% GPU util.
+                    // 82% was chosen from CSV analysis: ComfyUI inference first steps hit
+                    // ~84% of the Dynamic-Boost TGP; 0.94 triggered 15 s too late.
+                    status.gpu_util >= 60
+                        && status.power_w >= tgp * 0.82
+                };
+
+                if high_power_guard != prev_guard {
+                    if high_power_guard {
+                        GUARD_ENTERED_MS.store(now_ms, Ordering::Relaxed);
+                        GUARD_ENTRY_TGP.store(tgp as u32, Ordering::Relaxed);
+                        warn!(
+                            "High-power flicker guard enabled: {:.1}W draw near {:.0}W enforced TGP",
+                            status.power_w,
+                            status.power_limit_w,
+                        );
+                    } else {
+                        info!(
+                            "High-power flicker guard disabled: {:.1}W draw below {:.0}W enforced TGP",
+                            status.power_w,
+                            status.power_limit_w,
+                        );
+                    }
+                    HIGH_POWER_FLICKER_GUARD.store(high_power_guard, Ordering::Relaxed);
+                }
+
+                let new_sleep = if high_power_guard {
+                    1000 // freeze effect updates and back off the animator loop itself
+                } else if status.gpu_util >= 70 {
                     333 // ~3 FPS — reduced EC traffic during heavy GPU load
                 } else if status.gpu_util <= 20 {
                     kbd::ANIMATION_SLEEP_MS // restore normal 10 FPS when idle
@@ -246,6 +340,14 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
                 if let Ok(mut d) = DEV_MANAGER.lock() {
                     d.set_ac_state(*online);
                 }
+                // Always clear the GPU cache on an AC state transition:
+                // on battery → the cached AC TGP (e.g. 150 W Gaming) would be
+                //   misleading once the GPU runtime-suspends;
+                // on AC connect → the cached "0 W suspended" placeholder would
+                //   persist for up to 3 s before the GPU monitor next queries.
+                gpu::clear_gpu_cache();
+                HIGH_POWER_FLICKER_GUARD.store(false, Ordering::Relaxed);
+                ANIM_SLEEP_MS.store(kbd::ANIMATION_SLEEP_MS, Ordering::Relaxed);
             }
             true
         });
@@ -367,6 +469,12 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                 } else {
                     warn!("Power mode mismatch: sent {} but EC reports {} (HID write may have failed)", pwr, confirmed);
                 }
+                // Invalidate the GPU cache so the next GetGpuStatus call fetches
+                // fresh nvidia-smi data reflecting the new TGP for this profile.
+                // nvidia-powerd (NVPCF2) may take ~1-2 s to update enforced.power.limit;
+                // the stale cache value would otherwise persist for the full 3 s poll
+                // window and confuse the user into thinking TGP did not change.
+                gpu::clear_gpu_cache();
                 Some(comms::DaemonResponse::SetPowerMode { result: ok })
             },
             comms::DaemonCommand::SetFanSpeed { ac, rpm } => {
@@ -482,29 +590,35 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                 // spawning a second nvidia-smi per GUI poll cycle.
                 // Fall back to a direct query only if the cache is cold
                 // (e.g., first request after daemon start).
+                let on_ac = d.get_device()
+                    .map(|laptop| laptop.get_ac_state() == 1)
+                    .unwrap_or(true);
                 let status = gpu::get_cached_gpu_status().or_else(|| {
-                    if SYSTEM_SLEEPING.load(Ordering::Relaxed) { None }
+                    if SYSTEM_SLEEPING.load(Ordering::Relaxed) || !gpu::should_query_nvidia(on_ac) {
+                        None
+                    }
                     else {
                         let s = gpu::query_nvidia_gpu();
                         if let Some(ref s) = s { gpu::store_gpu_cache(s); }
                         s
                     }
+                }).unwrap_or_else(|| gpu::GpuStatus {
+                    name: "NVIDIA GPU (runtime suspended)".into(),
+                    ..gpu::GpuStatus::default()
                 });
-                if let Some(status) = status {
-                    return Some(comms::DaemonResponse::GetGpuStatus {
-                        name: status.name,
-                        temp_c: status.temp_c,
-                        gpu_util: status.gpu_util,
-                        mem_util: status.mem_util,
-                        power_w: status.power_w,
-                        power_limit_w: status.power_limit_w,
-                        mem_used_mb: status.mem_used_mb,
-                        mem_total_mb: status.mem_total_mb,
-                        clock_gpu_mhz: status.clock_gpu_mhz,
-                        clock_mem_mhz: status.clock_mem_mhz,
-                    });
-                }
-                return None;
+                return Some(comms::DaemonResponse::GetGpuStatus {
+                    name: status.name,
+                    temp_c: status.temp_c,
+                    gpu_util: status.gpu_util,
+                    mem_util: status.mem_util,
+                    power_w: status.power_w,
+                    power_limit_w: status.power_limit_w,
+                    power_max_limit_w: status.power_max_limit_w,
+                    mem_used_mb: status.mem_used_mb,
+                    mem_total_mb: status.mem_total_mb,
+                    clock_gpu_mhz: status.clock_gpu_mhz,
+                    clock_mem_mhz: status.clock_mem_mhz,
+                });
             }
 
             comms::DaemonCommand::GetPowerLimits => {
@@ -528,6 +642,13 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                     pl2_watts as u64 * 1_000_000,
                 );
                 return Some(comms::DaemonResponse::SetPowerLimits { result: ok1 && ok2 });
+            }
+
+            comms::DaemonCommand::GetCurrentEffect => {
+                let info = EFFECT_MANAGER.lock().ok()
+                    .and_then(|mut em| em.get_current_effect_info());
+                let (name, args) = info.unwrap_or_else(|| (String::new(), Vec::new()));
+                return Some(comms::DaemonResponse::GetCurrentEffect { name, args });
             }
 
         };

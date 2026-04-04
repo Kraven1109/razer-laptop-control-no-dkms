@@ -7,7 +7,7 @@ use std::ops;
 pub const KEYS_PER_ROW: usize = 15;
 pub const ROWS: usize = 6;
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 /// Represents the colour channels for a key
 pub struct KeyColour {
     /// Red channel
@@ -126,7 +126,7 @@ impl PartialOrd for AnimatorKeyColour {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 /// Represents a horizontal row of 15 keys on the keyboard
 pub struct RowData {
     keys: [KeyColour; KEYS_PER_ROW],
@@ -169,7 +169,7 @@ impl RowData {
         (0..KEYS_PER_ROW).for_each(|x| self.set_key_color(x, r, g, b)) // Sets the entire row
     }
 
-    pub fn get_row_data(&mut self) -> Vec<u8> {
+    pub fn get_row_data(&self) -> Vec<u8> {
         // *3 as itll be the RGB values
         let mut v = Vec::<u8>::with_capacity(3 * KEYS_PER_ROW);
         self.keys.iter().for_each(|k| {
@@ -194,12 +194,24 @@ impl KeyboardData {
         };
     }
 
-    pub fn update_kbd(&mut self, laptop: &mut device::RazerLaptop) -> bool {
-        // driver_sysfs::write_rgb_map(self.get_curr_state())
+    pub fn update_kbd(&self, laptop: &mut device::RazerLaptop, last_sent_rows: &mut Option<[RowData; ROWS]>) -> bool {
+        // Only send rows that actually changed. Rewriting the full frame at 10 FPS
+        // creates unnecessary EC/HID traffic and worsens PRIME flicker under load.
+        let mut changed = false;
         for idx in 0..ROWS {
-            laptop.set_custom_frame_data(idx as u8, self.rows[idx].get_row_data());
+            let row_changed = last_sent_rows
+                .as_ref()
+                .map(|prev| prev[idx] != self.rows[idx])
+                .unwrap_or(true);
+            if row_changed {
+                laptop.set_custom_frame_data(idx as u8, self.rows[idx].get_row_data());
+                changed = true;
+            }
         }
-        return true;
+        if changed {
+            *last_sent_rows = Some(self.rows);
+        }
+        return changed;
     }
 
     pub fn update_custom_mode(&mut self, laptop: &mut device::RazerLaptop) -> bool {
@@ -246,9 +258,9 @@ impl KeyboardData {
         self.rows[index / KEYS_PER_ROW].keys[index % KEYS_PER_ROW] = col
     }
 
-    pub fn get_curr_state(&mut self) -> Vec<u8> {
+    pub fn get_curr_state(&self) -> Vec<u8> {
         let mut all_vals = Vec::<u8>::with_capacity(3 * KEYS_PER_ROW * ROWS);
-        for row in self.rows.iter_mut() {
+        for row in self.rows.iter() {
             all_vals.extend(&row.get_row_data());
         }
         return all_vals;

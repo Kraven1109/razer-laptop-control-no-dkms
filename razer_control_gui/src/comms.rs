@@ -30,6 +30,7 @@ pub enum DaemonCommand {
     GetGpuStatus,
     GetPowerLimits,
     SetPowerLimits { pl1_watts: u32, pl2_watts: u32 },
+    GetCurrentEffect,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -62,6 +63,7 @@ pub enum DaemonResponse {
         mem_util: u8,
         power_w: f32,
         power_limit_w: f32,
+        power_max_limit_w: f32,
         mem_used_mb: u32,
         mem_total_mb: u32,
         clock_gpu_mhz: u32,
@@ -73,6 +75,10 @@ pub enum DaemonResponse {
         pl1_max_watts: u32,
     },
     SetPowerLimits { result: bool },
+    /// Name is the internal effect name (e.g. "Static", "Rainbow Wave"); args are
+    /// the raw parameter bytes as passed to the effect constructor.
+    /// Returns None-equivalent (name="", args=[]) if no effect is loaded.
+    GetCurrentEffect { name: String, args: Vec<u8> },
 }
 
 #[allow(dead_code)]
