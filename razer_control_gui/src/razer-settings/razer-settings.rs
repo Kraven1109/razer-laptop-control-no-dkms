@@ -1094,40 +1094,80 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
                     }
                 ));
 
+                // ── KWin "keep above" rule ────────────────────────────────────
+                // Write a persistent kwinrulesrc rule BEFORE presenting the window.
+                // KWin's "Apply Initially" policy (aboverule=2) sets keepAbove when
+                // the window is first mapped — no timing race with scripting delays.
+                // kwriteconfig6 handles the INI format correctly.
+                // On the very first call this blocks ~150 ms (8 subprocesses);
+                // subsequent calls only call qdbus6 reconfigure (~20 ms).
+                {
+                    let count: usize = std::process::Command::new("kreadconfig6")
+                        .args(["--file", "kwinrulesrc", "--group", "General",
+                               "--key", "count", "--default", "0"])
+                        .output().ok()
+                        .and_then(|o| String::from_utf8(o.stdout).ok())
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(0);
+                    let already = (1..=count).any(|i| {
+                        std::process::Command::new("kreadconfig6")
+                            .args(["--file", "kwinrulesrc", "--group", &i.to_string(),
+                                   "--key", "Description", "--default", ""])
+                            .output().ok()
+                            .and_then(|o| String::from_utf8(o.stdout).ok())
+                            .map(|s| s.contains("razer-gpu-monitor"))
+                            .unwrap_or(false)
+                    });
+                    if !already {
+                        let n = (count + 1).to_string();
+                        for (k, v) in [("Description","razer-gpu-monitor"),("above","true"),
+                                       ("aboverule","2"),("title","GPU Monitor"),
+                                       ("titlematch","2"),("wmclassmatch","0")] {
+                            let _ = std::process::Command::new("kwriteconfig6")
+                                .args(["--file","kwinrulesrc","--group",&n,"--key",k,v])
+                                .status();
+                        }
+                        let _ = std::process::Command::new("kwriteconfig6")
+                            .args(["--file","kwinrulesrc","--group","General",
+                                   "--key","count",&n]).status();
+                    }
+                    // Reload rules synchronously — the window maps AFTER this returns.
+                    let _ = std::process::Command::new("qdbus6")
+                        .args(["org.kde.KWin","/KWin","org.kde.KWin.reconfigure"])
+                        .status();
+                }
                 float_win.set_child(Some(&float_chart));
                 float_win.present();
 
-                // Auto-pin on top via KWin scripting (KDE Plasma 5 & 6).
-                // We match by window caption — more reliable than PID in the KWin QML
-                // sandbox. Delayed 1.2 s so the window is fully mapped in the compositor.
+                // KWin scripting backup — catches cases where "Apply Initially"
+                // rule doesn't fire (e.g. compositor restarts or rule policy mismatch).
+                // Uses a larger delay (2 s) and unique script name to avoid cached IDs.
                 glib::timeout_add_local(
-                    std::time::Duration::from_millis(1200),
+                    std::time::Duration::from_millis(2000),
                     move || {
-                        // KWin QML JS engine does not accept IIFEs — top-level
-                        // statements only. `workspace.windows` is the Plasma 6 API.
-                        let script = r#"var wins = workspace.windows;
+                        let script = r#"var wins = workspace.windows || [];
 for (var i = 0; i < wins.length; i++) {
-    if (wins[i].caption.indexOf("GPU Monitor") !== -1) {
+    if (wins[i] && wins[i].caption &&
+            wins[i].caption.indexOf("GPU Monitor") !== -1) {
         wins[i].keepAbove = true;
     }
 }"#;
-                        let tmp = std::path::Path::new("/tmp/razer-kwin-pin.js");
-                        if std::fs::write(tmp, script).is_ok() {
-                            let _ = std::process::Command::new("qdbus6")
-                                .args(["org.kde.KWin", "/Scripting",
-                                       "org.kde.kwin.Scripting.unloadScript",
-                                       "razer-pin"])
-                                .status();
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default().as_millis();
+                        let script_name = format!("razer-pin-{ts}");
+                        let tmp = std::env::temp_dir().join("razer-kwin-pin.js");
+                        if std::fs::write(&tmp, script).is_ok() {
                             let _ = std::process::Command::new("qdbus6")
                                 .args(["org.kde.KWin", "/Scripting",
                                        "org.kde.kwin.Scripting.loadScript",
-                                       "/tmp/razer-kwin-pin.js", "razer-pin"])
+                                       tmp.to_str().unwrap_or(""), &script_name])
                                 .status();
                             let _ = std::process::Command::new("qdbus6")
                                 .args(["org.kde.KWin", "/Scripting",
                                        "org.kde.kwin.Scripting.start"])
                                 .status();
-                            let _ = std::fs::remove_file(tmp);
+                            let _ = std::fs::remove_file(&tmp);
                         }
                         glib::ControlFlow::Break
                     },

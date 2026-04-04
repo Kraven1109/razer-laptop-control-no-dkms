@@ -266,7 +266,10 @@ pub fn start_gpu_load_monitor_task() -> JoinHandle<()> {
                 }
 
                 let new_sleep = if high_power_guard {
-                    1000 // freeze effect updates and back off the animator loop itself
+                    // Virtually stop all keyboard HID writes during heavy GPU load.
+                    // 600 s between animation frames ≈ 0 EC traffic from our app,
+                    // leaving only nvidia-powerd NVPCF2 writes on the EC bus.
+                    600_000
                 } else if status.gpu_util >= 70 {
                     333 // ~3 FPS — reduced EC traffic during heavy GPU load
                 } else if status.gpu_util <= 20 {
