@@ -1098,20 +1098,21 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
                 float_win.present();
 
                 // Auto-pin on top via KWin scripting (KDE Plasma 5 & 6).
-                // Matches by PID (more reliable than window title).
-                // Delayed 800 ms so the window is fully mapped in the compositor first.
-                let pid = std::process::id();
+                // We match by window caption — more reliable than PID in the KWin QML
+                // sandbox. Delayed 1.2 s so the window is fully mapped in the compositor.
                 glib::timeout_add_local(
-                    std::time::Duration::from_millis(800),
+                    std::time::Duration::from_millis(1200),
                     move || {
-                        let script = format!(
-                            r#"var pid={pid};var wins=typeof workspace.windows!=="undefined"?workspace.windows:(workspace.windowList?workspace.windowList():[]);for(var i=0;i<wins.length;i++){{if(wins[i]&&wins[i].pid===pid){{wins[i].keepAbove=true;}}}}"
-                            "#
-                        );
+                        // KWin QML JS engine does not accept IIFEs — top-level
+                        // statements only. `workspace.windows` is the Plasma 6 API.
+                        let script = r#"var wins = workspace.windows;
+for (var i = 0; i < wins.length; i++) {
+    if (wins[i].caption.indexOf("GPU Monitor") !== -1) {
+        wins[i].keepAbove = true;
+    }
+}"#;
                         let tmp = std::path::Path::new("/tmp/razer-kwin-pin.js");
-                        if std::fs::write(tmp, script.trim()).is_ok() {
-                            // Unload any stale copy first so start() won't run
-                            // the old script alongside the new one.
+                        if std::fs::write(tmp, script).is_ok() {
                             let _ = std::process::Command::new("qdbus6")
                                 .args(["org.kde.KWin", "/Scripting",
                                        "org.kde.kwin.Scripting.unloadScript",

@@ -227,25 +227,23 @@ pub fn start_gpu_load_monitor_task() -> JoinHandle<()> {
                 // below the stay threshold for only a few seconds.
                 const GUARD_MIN_HOLD_MS: u64 = 20_000;
                 let guard_held_ms = now_ms.saturating_sub(GUARD_ENTERED_MS.load(Ordering::Relaxed));
-                let high_power_guard = if tgp <= 0.0 {
-                    false // No TGP data — don't guard
-                } else if prev_guard && guard_held_ms < GUARD_MIN_HOLD_MS {
-                    // Inside minimum hold window — stay armed unconditionally
+                // CSV analysis (ComfyUI inference) showed power during active steps is
+                // only 62–85% of Dynamic-Boost TGP while GPU util is 80–98%.  Any
+                // power-based threshold therefore misses most of the load window.
+                // The EC interrupt contention that causes PRIME flicker happens whenever
+                // the GPU is genuinely busy, regardless of absolute watts drawn.
+                // Solution: guard on util alone; power threshold removed entirely.
+                let high_power_guard = if prev_guard && guard_held_ms < GUARD_MIN_HOLD_MS {
+                    // Inside minimum hold window — stay armed unconditionally.
+                    // Covers inter-step idle gaps in ComfyUI (~9 s) where util drops
+                    // to 0 between compute bursts.
                     true
                 } else if prev_guard {
-                    // Hysteresis after min-hold: use the TGP recorded when the guard
-                    // entered as reference, so a Dynamic-Boost ceiling increase does not
-                    // spuriously raise the stay threshold and release the guard.
-                    let entry_tgp = GUARD_ENTRY_TGP.load(Ordering::Relaxed) as f32;
-                    let ref_tgp = entry_tgp.max(0.0);
-                    status.gpu_util >= 40
-                        && status.power_w >= ref_tgp * 0.88
+                    // After min-hold: release only when GPU has truly gone idle.
+                    status.gpu_util >= 30
                 } else {
-                    // Enter guard when drawing ≥ 82% of enforced TGP at ≥ 60% GPU util.
-                    // 82% was chosen from CSV analysis: ComfyUI inference first steps hit
-                    // ~84% of the Dynamic-Boost TGP; 0.94 triggered 15 s too late.
+                    // Arm when GPU compute hits sustained load.
                     status.gpu_util >= 60
-                        && status.power_w >= tgp * 0.82
                 };
 
                 if high_power_guard != prev_guard {
