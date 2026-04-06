@@ -54,6 +54,34 @@ pub fn get_cached_gpu_status() -> Option<GpuStatus> {
     GPU_STATUS_CACHE.lock().ok().and_then(|g| g.clone())
 }
 
+/// Count the number of file-descriptor symlinks in `/proc/*/fd/` that point to
+/// `/dev/dri/renderD128` (the NVIDIA DRM render node on this system).
+///
+/// At rest the baseline is VS Code + Edge + razer-settings = ~4 fds.
+/// When a game or other PRIME-offloaded app starts, the count increases.
+/// Reading /proc symlinks does NOT acquire any NVIDIA driver lock and takes
+/// only a few milliseconds, making it safe to call on every GPU monitor tick.
+pub fn count_nvidia_render_fds() -> usize {
+    let Ok(procs) = fs::read_dir("/proc") else { return 0 };
+    let mut count = 0usize;
+    for proc_entry in procs.flatten() {
+        // Only entries that look like PIDs (pure digits)
+        if !proc_entry.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let fd_dir = proc_entry.path().join("fd");
+        let Ok(fds) = fs::read_dir(&fd_dir) else { continue };
+        for fd in fds.flatten() {
+            if let Ok(target) = fs::read_link(fd.path()) {
+                if target.to_string_lossy() == "/dev/dri/renderD128" {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
 /// Returns true when it is reasonable to query nvidia-smi.
 /// On battery, avoid touching the dGPU if the kernel already runtime-suspended it.
 pub fn should_query_nvidia(on_ac: bool) -> bool {

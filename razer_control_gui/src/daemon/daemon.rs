@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::{atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}, Mutex};
+use std::sync::{atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time;
 
@@ -50,6 +50,16 @@ lazy_static! {
     /// for the stay condition: Dynamic Boost can raise TGP mid-guard, which
     /// would otherwise lift the stay threshold and cause spurious early releases.
     static ref GUARD_ENTRY_TGP: AtomicU32 = AtomicU32::new(0);
+    /// Unix-epoch milliseconds of the last nvidia-smi call made while the guard
+    /// was already armed (the periodic re-check calls).  Reset to 0 when the
+    /// guard is newly armed so the GUARD_HOLD_MS window starts cleanly.
+    static ref GUARD_LAST_CHECK_MS: AtomicU64 = AtomicU64::new(0);
+    /// Baseline count of /dev/dri/renderD128 (NVIDIA render node) file
+    /// descriptors open across all processes.  Established on startup when the
+    /// GPU is idle.  A sudden increase means a new PRIME-offload app (game) has
+    /// opened the NVIDIA render device → we can arm the flicker guard without
+    /// calling nvidia-smi, avoiding the NVML mutex stall at game-start.
+    static ref RENDER128_BASELINE: AtomicUsize = AtomicUsize::new(usize::MAX);
     /// Set to true while the system is suspended so GPU polling and HID
     /// writes are suppressed until the device is re-opened after resume.
     static ref SYSTEM_SLEEPING: AtomicBool = AtomicBool::new(false);
@@ -190,112 +200,137 @@ fn gpu_monitor_on_ac() -> bool {
 /// drops back below a lower release threshold.
 pub fn start_gpu_load_monitor_task() -> JoinHandle<()> {
     thread::spawn(|| {
+        // Establish the renderD128 (NVIDIA DRM render node) fd baseline before
+        // entering the poll loop.  We wait a few seconds for the desktop to
+        // fully settle first (kwin, VS Code, Edge etc. all open renderD128).
+        // Any subsequent *increase* over this baseline means a new PRIME-offload
+        // app (game) just started — we can ARM the guard instantly, with zero
+        // nvidia-smi calls, avoiding the NVML mutex stall at game-launch time.
+        thread::sleep(std::time::Duration::from_secs(5));
+        let baseline = gpu::count_nvidia_render_fds();
+        RENDER128_BASELINE.store(baseline, Ordering::Relaxed);
+        info!("PRIME renderD128 baseline: {} fds open", baseline);
+
         loop {
             let on_ac = gpu_monitor_on_ac();
-            // When the flicker guard is armed, extend the nvidia-smi poll from
-            // 3 s to 30 s.  nvidia-smi spawning briefly acquires a driver-level
-            // lock that blocks the PRIME DMA completion fence; with the guard
-            // active the i915 pageflip was seeing 1368 ms timeouts every 3 s
-            // (confirmed in kwin_wayland journal).  The guard min-hold (20 s)
-            // keeps the keyboard frozen without any new data during this window;
-            // after 30 s one nvidia-smi runs to check whether the GPU has
-            // actually gone idle and the guard should release.
-            let poll_secs = if HIGH_POWER_FLICKER_GUARD.load(Ordering::Relaxed) {
-                30
-            } else if on_ac {
-                3
-            } else {
-                10
-            };
-            thread::sleep(std::time::Duration::from_secs(poll_secs));
-            // Skip GPU polling while system is suspended — avoids waking the
-            // NVIDIA GPU out of D3cold and prevents stale nvidia-smi calls.
+            thread::sleep(std::time::Duration::from_secs(if on_ac { 3 } else { 10 }));
+
             if SYSTEM_SLEEPING.load(Ordering::Relaxed) {
                 continue;
             }
-            // On battery, do not spawn nvidia-smi if the kernel has already
-            // runtime-suspended the dGPU. Re-waking it every few seconds keeps
-            // PRIME active and can manifest as light panel flicker after resume.
             if !gpu::should_query_nvidia(on_ac) {
                 HIGH_POWER_FLICKER_GUARD.store(false, Ordering::Relaxed);
                 ANIM_SLEEP_MS.store(kbd::ANIMATION_SLEEP_MS, Ordering::Relaxed);
                 gpu::clear_gpu_cache();
                 continue;
             }
+
+            let prev_guard = HIGH_POWER_FLICKER_GUARD.load(Ordering::Relaxed);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            // ── Core anti-flicker logic ──────────────────────────────────────
+            // nvidia-smi acquires the NVIDIA driver's global mutex.  While held,
+            // the PRIME DMA completion fence is blocked.  VS Code, Edge, and our
+            // own GUI all render on renderD128 (NVIDIA) and those frames are
+            // PRIME-copied to Intel for KWin — so there is ALWAYS a PRIME fence
+            // in flight.  At ≥ 60 % GPU util the mutex hold can exceed 1 368 ms,
+            // triggering i915's "Pageflip timed out!" bug → 1-second blank screen.
+            // (Confirmed in kwin_wayland journal; "not as severe in Silent profile"
+            // → stall is proportional to driver busyness = GPU utilisation.)
+            //
+            // Two-track approach:
+            //
+            //  Track A — Gaming (new /dev/dri/renderD128 fd delta):
+            //    Games open renderD128 at launch.  Count increase > baseline + 2
+            //    → ARM guard instantly, ZERO nvidia-smi, no NVML mutex stall.
+            //
+            //  Track B — CUDA / ComfyUI (util threshold at low load):
+            //    CUDA never opens renderD128.  nvidia-smi is called but with a
+            //    LOW threshold (30 %) so it fires during model loading, when the
+            //    driver is lightly loaded and the mutex is held for < 200 ms —
+            //    well below the 1 000 ms i915 timeout, invisible to the user.
+            //
+            //  After ARM (either track): 120-s dead zone, then 2-minute periodic
+            //  check via nvidia-smi.  Release when util < 15 %.
+            const GUARD_HOLD_MS: u64 = 120_000; // no nvidia-smi for first 2 min
+            const GUARD_POLL_MS: u64 = 120_000; // then check every 2 min
+            const ARM_UTIL:     u8   = 30;       // arm at 30 % (fast NVML)
+            const RELEASE_UTIL: u8   = 15;       // release when truly idle
+
+            // ── Track A: gaming start via renderD128 delta ───────────────────
+            let prime_fds  = gpu::count_nvidia_render_fds();
+            let guard_base = RENDER128_BASELINE.load(Ordering::Relaxed);
+            let new_prime_app = guard_base != usize::MAX
+                && prime_fds > guard_base.saturating_add(2);
+
+            if new_prime_app && !prev_guard {
+                let tgp = gpu::get_cached_gpu_status()
+                    .map(|s| s.power_limit_w as u32)
+                    .unwrap_or(150);
+                GUARD_ENTERED_MS.store(now_ms, Ordering::Relaxed);
+                GUARD_ENTRY_TGP.store(tgp, Ordering::Relaxed);
+                GUARD_LAST_CHECK_MS.store(0, Ordering::Relaxed);
+                HIGH_POWER_FLICKER_GUARD.store(true, Ordering::Relaxed);
+                ANIM_SLEEP_MS.store(600_000, Ordering::Relaxed);
+                warn!(
+                    "Flicker guard enabled (gaming): {} → {} renderD128 fds, no nvidia-smi",
+                    guard_base, prime_fds,
+                );
+                continue;
+            }
+
+            // ── Guard active: dead zone / periodic-check skip ─────────────────
+            if prev_guard {
+                let guard_held_ms =
+                    now_ms.saturating_sub(GUARD_ENTERED_MS.load(Ordering::Relaxed));
+                let since_check = {
+                    let lc = GUARD_LAST_CHECK_MS.load(Ordering::Relaxed);
+                    if lc == 0 { u64::MAX } else { now_ms.saturating_sub(lc) }
+                };
+                if guard_held_ms < GUARD_HOLD_MS || since_check < GUARD_POLL_MS {
+                    continue;
+                }
+                GUARD_LAST_CHECK_MS.store(now_ms, Ordering::Relaxed);
+            }
+
+            // ── nvidia-smi call (guard off OR periodic check while armed) ─────
             if let Some(status) = gpu::query_nvidia_gpu() {
-                // Populate the GPU status cache so GetGpuStatus requests from
-                // the GUI are served without spawning additional nvidia-smi
-                // processes — one nvidia-smi every 3 s on AC or 10 s on
-                // battery is enough.
                 gpu::store_gpu_cache(&status);
 
-                let prev_guard = HIGH_POWER_FLICKER_GUARD.load(Ordering::Relaxed);
-                // Use TGP-relative thresholds so the guard fires in every profile
-                // (Silent=115 W, Balanced=135 W, Gaming=150 W, etc.) when the GPU
-                // is operating near its enforced TGP.  The absolute guard previously
-                // used (>= 140 W) never triggered in Silent or Balanced modes where
-                // EC/NVPCF contention can also cause display glitches under load.
-                let tgp = status.power_limit_w;
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                // Minimum hold: once armed, keep the guard active for at least
-                // GUARD_MIN_HOLD_MS regardless of power drops.  This prevents
-                // oscillation during workloads (e.g. ComfyUI inference) where
-                // the GPU briefly idles between compute bursts and power drops
-                // below the stay threshold for only a few seconds.
-                const GUARD_MIN_HOLD_MS: u64 = 20_000;
-                let guard_held_ms = now_ms.saturating_sub(GUARD_ENTERED_MS.load(Ordering::Relaxed));
-                // CSV analysis (ComfyUI inference) showed power during active steps is
-                // only 62–85% of Dynamic-Boost TGP while GPU util is 80–98%.  Any
-                // power-based threshold therefore misses most of the load window.
-                // The EC interrupt contention that causes PRIME flicker happens whenever
-                // the GPU is genuinely busy, regardless of absolute watts drawn.
-                // Solution: guard on util alone; power threshold removed entirely.
-                let high_power_guard = if prev_guard && guard_held_ms < GUARD_MIN_HOLD_MS {
-                    // Inside minimum hold window — stay armed unconditionally.
-                    // Covers inter-step idle gaps in ComfyUI (~9 s) where util drops
-                    // to 0 between compute bursts.
-                    true
-                } else if prev_guard {
-                    // After min-hold: release only when GPU has truly gone idle.
-                    status.gpu_util >= 30
-                } else {
-                    // Arm when GPU compute hits sustained load.
-                    status.gpu_util >= 60
-                };
-
-                if high_power_guard != prev_guard {
-                    if high_power_guard {
-                        GUARD_ENTERED_MS.store(now_ms, Ordering::Relaxed);
-                        GUARD_ENTRY_TGP.store(tgp as u32, Ordering::Relaxed);
-                        warn!(
-                            "High-power flicker guard enabled: {:.1}W draw near {:.0}W enforced TGP",
-                            status.power_w,
-                            status.power_limit_w,
-                        );
-                    } else {
+                if prev_guard {
+                    if status.gpu_util < RELEASE_UTIL {
                         info!(
-                            "High-power flicker guard disabled: {:.1}W draw below {:.0}W enforced TGP",
-                            status.power_w,
-                            status.power_limit_w,
+                            "Flicker guard disabled: util={}%, {:.1}W",
+                            status.gpu_util, status.power_w,
                         );
+                        HIGH_POWER_FLICKER_GUARD.store(false, Ordering::Relaxed);
+                        // Refresh baseline so future gaming sessions are detected.
+                        RENDER128_BASELINE.store(prime_fds, Ordering::Relaxed);
                     }
-                    HIGH_POWER_FLICKER_GUARD.store(high_power_guard, Ordering::Relaxed);
+                    // else util still elevated → keep guard
+                } else if status.gpu_util >= ARM_UTIL {
+                    warn!(
+                        "Flicker guard enabled (CUDA/{}% util, {:.1}W)",
+                        status.gpu_util, status.power_w,
+                    );
+                    GUARD_ENTERED_MS.store(now_ms, Ordering::Relaxed);
+                    GUARD_ENTRY_TGP.store(status.power_limit_w as u32, Ordering::Relaxed);
+                    GUARD_LAST_CHECK_MS.store(0, Ordering::Relaxed);
+                    HIGH_POWER_FLICKER_GUARD.store(true, Ordering::Relaxed);
                 }
 
-                let new_sleep = if high_power_guard {
-                    // Virtually stop all keyboard HID writes during heavy GPU load.
-                    // 600 s between animation frames ≈ 0 EC traffic from our app,
-                    // leaving only nvidia-powerd NVPCF2 writes on the EC bus.
+                let current_guard = HIGH_POWER_FLICKER_GUARD.load(Ordering::Relaxed);
+                let new_sleep = if current_guard {
                     600_000
                 } else if status.gpu_util >= 70 {
-                    333 // ~3 FPS — reduced EC traffic during heavy GPU load
+                    333
                 } else if status.gpu_util <= 20 {
-                    kbd::ANIMATION_SLEEP_MS // restore normal 10 FPS when idle
+                    kbd::ANIMATION_SLEEP_MS
                 } else {
-                    ANIM_SLEEP_MS.load(Ordering::Relaxed) // keep current rate
+                    ANIM_SLEEP_MS.load(Ordering::Relaxed)
                 };
                 ANIM_SLEEP_MS.store(new_sleep, Ordering::Relaxed);
             }
