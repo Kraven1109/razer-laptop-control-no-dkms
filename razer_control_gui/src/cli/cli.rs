@@ -835,10 +835,10 @@ fn write_sync(sync: bool) {
 fn read_gpu_status() {
     match send_data(comms::DaemonCommand::GetGpuStatus) {
         Some(comms::DaemonResponse::GetGpuStatus {
-            name, temp_c, gpu_util, mem_util, power_w, power_limit_w, power_max_limit_w,
+            name, temp_c, gpu_util, mem_util, stale, power_w, power_limit_w, power_max_limit_w,
             mem_used_mb, mem_total_mb, clock_gpu_mhz, clock_mem_mhz
         }) => {
-            println!("GPU:         {}", name);
+            println!("GPU:         {}{}", name, if stale { " (cached)" } else { "" });
             println!("Temperature: {}°C", temp_c);
             println!("GPU Usage:   {}%", gpu_util);
             println!("VRAM Usage:  {}% ({} / {} MiB)", mem_util, mem_used_mb, mem_total_mb);
@@ -852,7 +852,9 @@ fn read_gpu_status() {
 }
 
 fn read_power_limits() {
-    match send_data(comms::DaemonCommand::GetPowerLimits) {
+    let ac = std::fs::read_to_string("/sys/class/power_supply/AC0/online")
+        .ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(1);
+    match send_data(comms::DaemonCommand::GetPowerLimits { ac }) {
         Some(comms::DaemonResponse::GetPowerLimits { pl1_watts, pl2_watts, pl1_max_watts }) => {
             println!("PL1 (sustained):  {} W", pl1_watts);
             println!("PL2 (boost):      {} W", pl2_watts);
@@ -864,7 +866,9 @@ fn read_power_limits() {
 }
 
 fn write_power_limits(pl1: u32, pl2: u32) {
-    match send_data(comms::DaemonCommand::SetPowerLimits { pl1_watts: pl1, pl2_watts: pl2 }) {
+    let ac = std::fs::read_to_string("/sys/class/power_supply/AC0/online")
+        .ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(1);
+    match send_data(comms::DaemonCommand::SetPowerLimits { ac, pl1_watts: pl1, pl2_watts: pl2 }) {
         Some(comms::DaemonResponse::SetPowerLimits { result: true }) => {
             println!("Power limits set: PL1={} W, PL2={} W", pl1, pl2);
         },

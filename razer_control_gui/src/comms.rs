@@ -28,8 +28,8 @@ pub enum DaemonCommand {
     GetBatteryHealthOptimizer (),
     GetDeviceName,
     GetGpuStatus,
-    GetPowerLimits,
-    SetPowerLimits { pl1_watts: u32, pl2_watts: u32 },
+    GetPowerLimits { ac: usize },
+    SetPowerLimits { ac: usize, pl1_watts: u32, pl2_watts: u32 },
     GetCurrentEffect,
 }
 
@@ -61,6 +61,7 @@ pub enum DaemonResponse {
         temp_c: i32,
         gpu_util: u8,
         mem_util: u8,
+        stale: bool,
         power_w: f32,
         power_limit_w: f32,
         power_max_limit_w: f32,
@@ -116,6 +117,10 @@ pub fn create() -> Option<UnixListener> {
 
 #[allow(dead_code)]
 pub fn send_to_daemon(command: DaemonCommand, mut sock: UnixStream) -> Option<DaemonResponse> {
+    // Bound the blocking time when the daemon is slow (e.g. right after sleep/resume).
+    // Without timeouts the GTK main thread can block indefinitely on a non-responsive daemon.
+    let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(1500)));
+    let _ = sock.set_write_timeout(Some(std::time::Duration::from_millis(1000)));
     if let Ok(encoded) = bincode::serialize(&command) {
         if sock.write_all(&encoded).is_ok() {
             let mut buf = [0u8; 4096];

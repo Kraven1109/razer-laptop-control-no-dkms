@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::{atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}, Mutex};
+use std::sync::{atomic::{AtomicBool, Ordering}, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time;
 
@@ -31,35 +31,6 @@ lazy_static! {
             Err(_) => Mutex::new(device::DeviceManager::new()),
         }
     };
-    /// Dynamic keyboard animation interval (milliseconds).
-    /// Raised under heavy GPU load to reduce EC USB traffic,
-    /// mitigating EC interrupt contention with NVPCF Dynamic Boost
-    /// that causes PRIME pipeline stalls (display flicker).
-    static ref ANIM_SLEEP_MS: AtomicU64 = AtomicU64::new(kbd::ANIMATION_SLEEP_MS);
-    /// When the GPU is operating very close to its enforced TGP, freeze keyboard
-    /// animation updates entirely. This is a stronger mitigation for the built-in
-    /// panel flicker seen on PRIME/Optimus laptops when EC traffic and NVIDIA's
-    /// Dynamic Boost negotiation overlap under peak load.
-    static ref HIGH_POWER_FLICKER_GUARD: AtomicBool = AtomicBool::new(false);
-    /// Unix-epoch milliseconds when the flicker guard last transitioned to true.
-    /// Used to enforce a minimum hold period so that brief idle gaps between
-    /// ComfyUI/game inference bursts do not prematurely release the guard.
-    static ref GUARD_ENTERED_MS: AtomicU64 = AtomicU64::new(0);
-    /// TGP (enforced.power.limit, in whole watts) recorded at the moment the
-    /// flicker guard was last enabled.  Used as a stable low-water reference
-    /// for the stay condition: Dynamic Boost can raise TGP mid-guard, which
-    /// would otherwise lift the stay threshold and cause spurious early releases.
-    static ref GUARD_ENTRY_TGP: AtomicU32 = AtomicU32::new(0);
-    /// Unix-epoch milliseconds of the last nvidia-smi call made while the guard
-    /// was already armed (the periodic re-check calls).  Reset to 0 when the
-    /// guard is newly armed so the GUARD_HOLD_MS window starts cleanly.
-    static ref GUARD_LAST_CHECK_MS: AtomicU64 = AtomicU64::new(0);
-    /// Baseline count of /dev/dri/renderD128 (NVIDIA render node) file
-    /// descriptors open across all processes.  Established on startup when the
-    /// GPU is idle.  A sudden increase means a new PRIME-offload app (game) has
-    /// opened the NVIDIA render device → we can arm the flicker guard without
-    /// calling nvidia-smi, avoiding the NVML mutex stall at game-start.
-    static ref RENDER128_BASELINE: AtomicUsize = AtomicUsize::new(usize::MAX);
     /// Set to true while the system is suspended so GPU polling and HID
     /// writes are suppressed until the device is re-opened after resume.
     static ref SYSTEM_SLEEPING: AtomicBool = AtomicBool::new(false);
@@ -98,6 +69,8 @@ fn main() {
                 if let Some(laptop) = d.get_device() {
                     laptop.set_config(config);
                 }
+                // Apply saved RAPL limits for the current AC state.
+                apply_rapl_for_profile(config.rapl_pl1_watts, config.rapl_pl2_watts);
             }
             d.restore_standard_effect();
             if let Ok(json) = config::Configuration::read_effects_file() {
@@ -164,22 +137,14 @@ pub fn start_keyboard_animator_task() -> JoinHandle<()> {
         loop {
             // Skip USB writes entirely while device is suspended — the HID fd
             // is closed during sleep and writes would fail or spin-wait.
-            if !SYSTEM_SLEEPING.load(Ordering::Relaxed) && !HIGH_POWER_FLICKER_GUARD.load(Ordering::Relaxed) {
+            if !SYSTEM_SLEEPING.load(Ordering::Relaxed) {
                 if let (Ok(mut dev), Ok(mut fx)) = (DEV_MANAGER.lock(), EFFECT_MANAGER.lock()) {
                     if let Some(laptop) = dev.get_device() {
                         fx.update(laptop);
                     }
                 }
             }
-            // Cap sleep at 200 ms so the animator notices when ANIM_SLEEP_MS
-            // is reset to normal (100 ms) after the flicker guard releases.
-            // Without this cap the thread sleeps for 600 000 ms (the guard
-            // value) and the keyboard stays frozen for up to 10 minutes after
-            // inference ends even though the guard has already been cleared.
-            // 200 ms cap: still 0 HID writes during guard (checked above), but
-            // the thread wakes and picks up the new sleep value within 200 ms.
-            let sleep_ms = ANIM_SLEEP_MS.load(Ordering::Relaxed).min(200);
-            thread::sleep(std::time::Duration::from_millis(sleep_ms));
+            thread::sleep(std::time::Duration::from_millis(kbd::ANIMATION_SLEEP_MS));
         }
     })
 }
@@ -191,26 +156,11 @@ fn gpu_monitor_on_ac() -> bool {
         .unwrap_or(true)
 }
 
-/// Monitors GPU utilization and dynamically adjusts keyboard animation rate.
-/// Under heavy GPU load (>70%), animation is slowed to 3 FPS to reduce EC USB
-/// HID traffic, lowering EC interrupt load during NVIDIA NVPCF Dynamic Boost
-/// negotiations. This mitigates PRIME display pipeline stalls that appear as
-/// display flickering on the built-in panel. When GPU draw gets very close to
-/// the enforced TGP, the keyboard animation is frozen completely until the GPU
-/// drops back below a lower release threshold.
+/// Polls the GPU every 3 s (on AC) or 10 s (on battery) and keeps the status
+/// cache fresh for GUI queries.  Anti-flicker guard logic has been removed;
+/// see memo.md "Archived — PRIME Anti-Flicker Guard Design" for reference.
 pub fn start_gpu_load_monitor_task() -> JoinHandle<()> {
     thread::spawn(|| {
-        // Establish the renderD128 (NVIDIA DRM render node) fd baseline before
-        // entering the poll loop.  We wait a few seconds for the desktop to
-        // fully settle first (kwin, VS Code, Edge etc. all open renderD128).
-        // Any subsequent *increase* over this baseline means a new PRIME-offload
-        // app (game) just started — we can ARM the guard instantly, with zero
-        // nvidia-smi calls, avoiding the NVML mutex stall at game-launch time.
-        thread::sleep(std::time::Duration::from_secs(5));
-        let baseline = gpu::count_nvidia_render_fds();
-        RENDER128_BASELINE.store(baseline, Ordering::Relaxed);
-        info!("PRIME renderD128 baseline: {} fds open", baseline);
-
         loop {
             let on_ac = gpu_monitor_on_ac();
             thread::sleep(std::time::Duration::from_secs(if on_ac { 3 } else { 10 }));
@@ -219,120 +169,11 @@ pub fn start_gpu_load_monitor_task() -> JoinHandle<()> {
                 continue;
             }
             if !gpu::should_query_nvidia(on_ac) {
-                HIGH_POWER_FLICKER_GUARD.store(false, Ordering::Relaxed);
-                ANIM_SLEEP_MS.store(kbd::ANIMATION_SLEEP_MS, Ordering::Relaxed);
                 gpu::clear_gpu_cache();
                 continue;
             }
-
-            let prev_guard = HIGH_POWER_FLICKER_GUARD.load(Ordering::Relaxed);
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-
-            // ── Core anti-flicker logic ──────────────────────────────────────
-            // nvidia-smi acquires the NVIDIA driver's global mutex.  While held,
-            // the PRIME DMA completion fence is blocked.  VS Code, Edge, and our
-            // own GUI all render on renderD128 (NVIDIA) and those frames are
-            // PRIME-copied to Intel for KWin — so there is ALWAYS a PRIME fence
-            // in flight.  At ≥ 60 % GPU util the mutex hold can exceed 1 368 ms,
-            // triggering i915's "Pageflip timed out!" bug → 1-second blank screen.
-            // (Confirmed in kwin_wayland journal; "not as severe in Silent profile"
-            // → stall is proportional to driver busyness = GPU utilisation.)
-            //
-            // Two-track approach:
-            //
-            //  Track A — Gaming (new /dev/dri/renderD128 fd delta):
-            //    Games open renderD128 at launch.  Count increase > baseline + 2
-            //    → ARM guard instantly, ZERO nvidia-smi, no NVML mutex stall.
-            //
-            //  Track B — CUDA / ComfyUI (util threshold at low load):
-            //    CUDA never opens renderD128.  nvidia-smi is called but with a
-            //    LOW threshold (30 %) so it fires during model loading, when the
-            //    driver is lightly loaded and the mutex is held for < 200 ms —
-            //    well below the 1 000 ms i915 timeout, invisible to the user.
-            //
-            //  After ARM (either track): 120-s dead zone, then 2-minute periodic
-            //  check via nvidia-smi.  Release when util < 15 %.
-            const GUARD_HOLD_MS: u64 = 120_000; // no nvidia-smi for first 2 min
-            const GUARD_POLL_MS: u64 = 120_000; // then check every 2 min
-            const ARM_UTIL:     u8   = 30;       // arm at 30 % (fast NVML)
-            const RELEASE_UTIL: u8   = 15;       // release when truly idle
-
-            // ── Track A: gaming start via renderD128 delta ───────────────────
-            let prime_fds  = gpu::count_nvidia_render_fds();
-            let guard_base = RENDER128_BASELINE.load(Ordering::Relaxed);
-            let new_prime_app = guard_base != usize::MAX
-                && prime_fds > guard_base.saturating_add(2);
-
-            if new_prime_app && !prev_guard {
-                let tgp = gpu::get_cached_gpu_status()
-                    .map(|s| s.power_limit_w as u32)
-                    .unwrap_or(150);
-                GUARD_ENTERED_MS.store(now_ms, Ordering::Relaxed);
-                GUARD_ENTRY_TGP.store(tgp, Ordering::Relaxed);
-                GUARD_LAST_CHECK_MS.store(0, Ordering::Relaxed);
-                HIGH_POWER_FLICKER_GUARD.store(true, Ordering::Relaxed);
-                ANIM_SLEEP_MS.store(600_000, Ordering::Relaxed);
-                warn!(
-                    "Flicker guard enabled (gaming): {} → {} renderD128 fds, no nvidia-smi",
-                    guard_base, prime_fds,
-                );
-                continue;
-            }
-
-            // ── Guard active: dead zone / periodic-check skip ─────────────────
-            if prev_guard {
-                let guard_held_ms =
-                    now_ms.saturating_sub(GUARD_ENTERED_MS.load(Ordering::Relaxed));
-                let since_check = {
-                    let lc = GUARD_LAST_CHECK_MS.load(Ordering::Relaxed);
-                    if lc == 0 { u64::MAX } else { now_ms.saturating_sub(lc) }
-                };
-                if guard_held_ms < GUARD_HOLD_MS || since_check < GUARD_POLL_MS {
-                    continue;
-                }
-                GUARD_LAST_CHECK_MS.store(now_ms, Ordering::Relaxed);
-            }
-
-            // ── nvidia-smi call (guard off OR periodic check while armed) ─────
             if let Some(status) = gpu::query_nvidia_gpu() {
                 gpu::store_gpu_cache(&status);
-
-                if prev_guard {
-                    if status.gpu_util < RELEASE_UTIL {
-                        info!(
-                            "Flicker guard disabled: util={}%, {:.1}W",
-                            status.gpu_util, status.power_w,
-                        );
-                        HIGH_POWER_FLICKER_GUARD.store(false, Ordering::Relaxed);
-                        // Refresh baseline so future gaming sessions are detected.
-                        RENDER128_BASELINE.store(prime_fds, Ordering::Relaxed);
-                    }
-                    // else util still elevated → keep guard
-                } else if status.gpu_util >= ARM_UTIL {
-                    warn!(
-                        "Flicker guard enabled (CUDA/{}% util, {:.1}W)",
-                        status.gpu_util, status.power_w,
-                    );
-                    GUARD_ENTERED_MS.store(now_ms, Ordering::Relaxed);
-                    GUARD_ENTRY_TGP.store(status.power_limit_w as u32, Ordering::Relaxed);
-                    GUARD_LAST_CHECK_MS.store(0, Ordering::Relaxed);
-                    HIGH_POWER_FLICKER_GUARD.store(true, Ordering::Relaxed);
-                }
-
-                let current_guard = HIGH_POWER_FLICKER_GUARD.load(Ordering::Relaxed);
-                let new_sleep = if current_guard {
-                    600_000
-                } else if status.gpu_util >= 70 {
-                    333
-                } else if status.gpu_util <= 20 {
-                    kbd::ANIMATION_SLEEP_MS
-                } else {
-                    ANIM_SLEEP_MS.load(Ordering::Relaxed)
-                };
-                ANIM_SLEEP_MS.store(new_sleep, Ordering::Relaxed);
             }
         }
     })
@@ -395,15 +236,14 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
                 info!("AC0 online: {:?}", online);
                 if let Ok(mut d) = DEV_MANAGER.lock() {
                     d.set_ac_state(*online);
+                    // Apply the RAPL profile saved for the new AC state.
+                    let ac = if *online { 1usize } else { 0usize };
+                    if let Some(cfg) = d.get_ac_config(ac) {
+                        apply_rapl_for_profile(cfg.rapl_pl1_watts, cfg.rapl_pl2_watts);
+                    }
                 }
-                // Always clear the GPU cache on an AC state transition:
-                // on battery → the cached AC TGP (e.g. 150 W Gaming) would be
-                //   misleading once the GPU runtime-suspends;
-                // on AC connect → the cached "0 W suspended" placeholder would
-                //   persist for up to 3 s before the GPU monitor next queries.
+                // Always clear GPU cache on AC state transition.
                 gpu::clear_gpu_cache();
-                HIGH_POWER_FLICKER_GUARD.store(false, Ordering::Relaxed);
-                ANIM_SLEEP_MS.store(kbd::ANIMATION_SLEEP_MS, Ordering::Relaxed);
             }
             true
         });
@@ -644,29 +484,32 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
             comms::DaemonCommand::GetGpuStatus => {
                 // Use the cache populated by the GPU load monitor to avoid
                 // spawning a second nvidia-smi per GUI poll cycle.
-                // Fall back to a direct query only if the cache is cold
-                // (e.g., first request after daemon start).
+                // Fall back to a direct query only if the cache is cold.
                 let on_ac = d.get_device()
                     .map(|laptop| laptop.get_ac_state() == 1)
                     .unwrap_or(true);
-                let status = gpu::get_cached_gpu_status().or_else(|| {
-                    if SYSTEM_SLEEPING.load(Ordering::Relaxed) || !gpu::should_query_nvidia(on_ac) {
-                        None
+                let status = if let Some(status) = gpu::get_cached_gpu_status() {
+                    status
+                } else if SYSTEM_SLEEPING.load(Ordering::Relaxed) || !gpu::should_query_nvidia(on_ac) {
+                    gpu::GpuStatus {
+                        name: "NVIDIA GPU (runtime suspended)".into(),
+                        ..gpu::GpuStatus::default()
                     }
-                    else {
-                        let s = gpu::query_nvidia_gpu();
-                        if let Some(ref s) = s { gpu::store_gpu_cache(s); }
+                } else {
+                    gpu::query_nvidia_gpu().map(|s| {
+                        gpu::store_gpu_cache(&s);
                         s
-                    }
-                }).unwrap_or_else(|| gpu::GpuStatus {
-                    name: "NVIDIA GPU (runtime suspended)".into(),
-                    ..gpu::GpuStatus::default()
-                });
+                    }).unwrap_or_else(|| gpu::GpuStatus {
+                        name: "NVIDIA GPU (runtime suspended)".into(),
+                        ..gpu::GpuStatus::default()
+                    })
+                };
                 return Some(comms::DaemonResponse::GetGpuStatus {
                     name: status.name,
                     temp_c: status.temp_c,
                     gpu_util: status.gpu_util,
                     mem_util: status.mem_util,
+                    stale: false,
                     power_w: status.power_w,
                     power_limit_w: status.power_limit_w,
                     power_max_limit_w: status.power_max_limit_w,
@@ -677,10 +520,18 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                 });
             }
 
-            comms::DaemonCommand::GetPowerLimits => {
-                let pl1 = read_rapl_uw("/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw");
-                let pl2 = read_rapl_uw("/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw");
+            comms::DaemonCommand::GetPowerLimits { ac } => {
                 let pl1_max = read_rapl_uw("/sys/class/powercap/intel-rapl:0/constraint_0_max_power_uw");
+                // Return the saved config values for the requested AC profile if set,
+                // otherwise fall back to the current sysfs (live) values.
+                let (pl1_cfg, pl2_cfg) = d.get_rapl_limits(ac);
+                let (pl1, pl2) = if pl1_cfg > 0 {
+                    (pl1_cfg as u64 * 1_000_000,
+                     pl2_cfg as u64 * 1_000_000)
+                } else {
+                    (read_rapl_uw("/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw"),
+                     read_rapl_uw("/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw"))
+                };
                 return Some(comms::DaemonResponse::GetPowerLimits {
                     pl1_watts: (pl1 / 1_000_000) as u32,
                     pl2_watts: (pl2 / 1_000_000) as u32,
@@ -688,16 +539,27 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                 });
             }
 
-            comms::DaemonCommand::SetPowerLimits { pl1_watts, pl2_watts } => {
-                let ok1 = write_rapl_uw(
-                    "/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw",
-                    pl1_watts as u64 * 1_000_000,
-                );
-                let ok2 = write_rapl_uw(
-                    "/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw",
-                    pl2_watts as u64 * 1_000_000,
-                );
-                return Some(comms::DaemonResponse::SetPowerLimits { result: ok1 && ok2 });
+            comms::DaemonCommand::SetPowerLimits { ac, pl1_watts, pl2_watts } => {
+                // Persist to config for the given AC profile.
+                let saved = d.set_rapl_limits(ac, pl1_watts, pl2_watts);
+                // Apply immediately only if we're currently on the matching AC state.
+                let current_ac = d.get_device()
+                    .map(|l| l.get_ac_state())
+                    .unwrap_or(1);
+                let applied = if current_ac == ac {
+                    let ok1 = write_rapl_uw(
+                        "/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw",
+                        pl1_watts as u64 * 1_000_000,
+                    );
+                    let ok2 = write_rapl_uw(
+                        "/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw",
+                        pl2_watts as u64 * 1_000_000,
+                    );
+                    ok1 && ok2
+                } else {
+                    true // saved to config; will apply on next AC state switch
+                };
+                return Some(comms::DaemonResponse::SetPowerLimits { result: saved && applied });
             }
 
             comms::DaemonCommand::GetCurrentEffect => {
@@ -722,4 +584,23 @@ fn read_rapl_uw(path: &str) -> u64 {
 
 fn write_rapl_uw(path: &str, value: u64) -> bool {
     std::fs::write(path, value.to_string()).is_ok()
+}
+
+/// Apply RAPL PL1/PL2 limits from a saved profile.
+/// Skips fields that are zero (meaning "not configured by user").
+fn apply_rapl_for_profile(pl1_watts: u32, pl2_watts: u32) {
+    if pl1_watts > 0 {
+        let _ = write_rapl_uw(
+            "/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw",
+            pl1_watts as u64 * 1_000_000,
+        );
+        info!("Applied RAPL PL1 = {} W", pl1_watts);
+    }
+    if pl2_watts > 0 {
+        let _ = write_rapl_uw(
+            "/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw",
+            pl2_watts as u64 * 1_000_000,
+        );
+        info!("Applied RAPL PL2 = {} W", pl2_watts);
+    }
 }

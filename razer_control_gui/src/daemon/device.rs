@@ -441,6 +441,25 @@ impl DeviceManager {
         return self.config.as_mut();
     }
 
+    pub fn get_rapl_limits(&mut self, ac: usize) -> (u32, u32) {
+        if let Some(cfg) = self.get_ac_config(ac) {
+            return (cfg.rapl_pl1_watts, cfg.rapl_pl2_watts);
+        }
+        (0, 0)
+    }
+
+    pub fn set_rapl_limits(&mut self, ac: usize, pl1_watts: u32, pl2_watts: u32) -> bool {
+        if let Some(config) = self.get_config() {
+            config.power[ac].rapl_pl1_watts = pl1_watts;
+            config.power[ac].rapl_pl2_watts = pl2_watts;
+            if let Err(e) = config.write_to_file() {
+                error!("Config write error (RAPL): {:?}", e);
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn find_supported_device(&mut self, vid: u16, pid: u16) -> Option<&SupportedDevice> {
         for device in &self.supported_devices {
             // Unwrap: we control the strings and know they are are valid

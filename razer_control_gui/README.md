@@ -20,6 +20,7 @@ Linux daemon and GUI for controlling Razer Blade laptops via HID (no kernel driv
 - **Battery Health Optimizer** — Charge threshold control (50-80%)
 - **NVIDIA GPU monitoring** — Real-time polling: temperature, utilization, VRAM, power draw, TGP limit, clocks
 - **Performance timeline chart** — Live 60s rolling chart: GPU temp / usage / power draw with wattage Y-axis and TGP reference line
+- **PRIME anti-flicker GPU guard** — Avoids extra `nvidia-smi` calls during PRIME-heavy gaming/ComfyUI bursts and marks held samples as cached in the GUI, CLI, and CSV log
 - **Smart animation throttle** — Keyboard RGB automatically slows to 3 FPS under heavy GPU load (≥70%), reducing EC interrupt contention with NVIDIA Dynamic Boost
 - **System tray quick actions** — Power modes, lighting effects, open settings
 - **Settings persistence** — All settings saved to disk and restored on daemon restart
@@ -158,21 +159,29 @@ system tray  ──┘                        │
 On Razer Blade 16 2023 with KDE Plasma + Wayland, the built-in display may flicker during
 heavy GPU workloads. External monitors are unaffected (they connect directly to the NVIDIA GPU).
 
-**Root cause:** NVIDIA Dynamic Boost 2.0 renegotiates the GPU TGP under load via the
-`\_SB_.NPCF` ACPI interface (between NVIDIA GSP firmware and Razer EC). Each TGP change
-causes a brief GPU clock/voltage transition that stalls frame delivery through the PRIME
-DMA path to the Intel display engine.
+Two separate issues were observed on this hardware:
 
-**Important:** `nvidia-smi -pl` does **not** work on this hardware (EC-controlled, NVML
-power capping refused). PSR is NOT enabled (panel does not support it).
+1. The daemon previously triggered visible PRIME stalls by spawning `nvidia-smi` during active
+    workloads. That path is now mitigated with a guard that arms early for games and CUDA loads,
+    suppresses extra NVML calls during the hot window, and labels repeated cache samples as cached.
+2. A remaining system-side flicker still exists on the internal eDP panel when Plasma Wayland is
+    driving HDR / Wide Color Gamut / EDR / 10-bit output in hybrid mode. The same workload is much
+    better with HDR disabled, and external USB-C displays are usually unaffected.
 
-**Daemon mitigation:** Keyboard RGB slows to 3 FPS when GPU ≥ 70%, reducing EC USB
-interrupt load during peak Dynamic Boost activity.
+**Current first-line mitigation:** disable HDR on the built-in panel in Plasma Display Configuration.
+If flicker remains, keep SDR and retry the same workload at 60 Hz.
 
-**Other mitigations:**
-- Set power mode to Gaming during demanding workloads (higher base TGP, smaller Dynamic Boost delta)
+**Important:** `nvidia-smi -pl` does **not** work on this hardware (EC-controlled, NVML power capping refused).
+
+**Project-side mitigations now in place:**
+- GPU status reads no longer sneak in an extra `nvidia-smi` while the flicker guard is armed
+- PRIME gaming starts can arm the guard from `/dev/dri/renderD128` fd growth without any NVML call
+- GUI history skips stale held samples, while GUI/CLI/CSV mark them as cached instead of pretending they are live
+
+**Still useful system mitigations:**
 - Use an external display for the most demanding tasks
-- Track `nvidia-utils` updates — this is a known PRIME sync regression that has been fixed in some driver versions
+- Track `nvidia-utils`, KWin, and Mesa updates for internal-panel PRIME/HDR fixes
+- If needed, test SDR at 60 Hz to confirm the remaining issue is panel-path specific
 
 ## Migration Notes
 

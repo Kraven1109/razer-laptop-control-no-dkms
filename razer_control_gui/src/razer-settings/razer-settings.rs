@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use adw::prelude::*;
@@ -35,7 +36,10 @@ fn send_data(opt: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
     match comms::try_bind() {
         Ok(socket) => comms::send_to_daemon(opt, socket),
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            crash_with_msg("Can't connect to the daemon");
+            // Daemon socket absent (briefly after restart/resume) — return None gracefully
+            // rather than crashing; poll timers will retry on the next tick.
+            eprintln!("Daemon socket not found: {error}");
+            return None;
         }
         Err(error) => {
             eprintln!("Error opening socket: {error}");
@@ -145,8 +149,9 @@ fn set_fan_speed(ac: bool, value: i32) -> Option<bool> {
     }
 }
 
-fn get_power_limits() -> Option<(u32, u32, u32)> {
-    match send_data(comms::DaemonCommand::GetPowerLimits)? {
+fn get_power_limits(ac: bool) -> Option<(u32, u32, u32)> {
+    let ac = if ac { 1 } else { 0 };
+    match send_data(comms::DaemonCommand::GetPowerLimits { ac })? {
         comms::DaemonResponse::GetPowerLimits { pl1_watts, pl2_watts, pl1_max_watts } => {
             Some((pl1_watts, pl2_watts, pl1_max_watts))
         }
@@ -154,8 +159,9 @@ fn get_power_limits() -> Option<(u32, u32, u32)> {
     }
 }
 
-fn set_power_limits(pl1: u32, pl2: u32) -> Option<bool> {
-    match send_data(comms::DaemonCommand::SetPowerLimits { pl1_watts: pl1, pl2_watts: pl2 })? {
+fn set_power_limits(ac: bool, pl1: u32, pl2: u32) -> Option<bool> {
+    let ac = if ac { 1 } else { 0 };
+    match send_data(comms::DaemonCommand::SetPowerLimits { ac, pl1_watts: pl1, pl2_watts: pl2 })? {
         comms::DaemonResponse::SetPowerLimits { result } => Some(result),
         r => { eprintln!("Unexpected: {r:?}"); None }
     }
@@ -214,7 +220,7 @@ impl SimpleComponent for App {
             &build_keyboard_page(), Some("keyboard"), "Keyboard", "input-keyboard-symbolic",
         );
         view_stack.add_titled_with_icon(
-            &build_about_page(&device), Some("about"), "About", "help-about-symbolic",
+            &build_system_page(&device), Some("system"), "System", "computer-symbolic",
         );
 
         let view_switcher = adw::ViewSwitcher::new();
@@ -422,18 +428,38 @@ fn build_power_page(ac: bool, device: &SupportedDevice) -> gtk::ScrolledWindow {
         spin_row.set_value(brightness as f64);
 
         let syncing_write = syncing.clone();
+        // Debounce: cancel any pending call when the value changes again within 200 ms,
+        // so rapid scrolling does not pile up blocking IPC calls on the main thread.
+        let debounce: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
         spin_row.connect_value_notify(move |row| {
             if *syncing_write.borrow() {
                 return;
             }
-            let val = row.value().clamp(0.0, 100.0) as u8;
-            set_brightness(ac, val);
-            let readback = get_brightness(ac).unwrap_or(val);
-            if readback != val {
-                *syncing_write.borrow_mut() = true;
-                row.set_value(readback as f64);
-                *syncing_write.borrow_mut() = false;
+            // Cancel the previous pending IPC call if the user is still scrolling.
+            if let Some(id) = debounce.borrow_mut().take() {
+                id.remove();
             }
+            let val = row.value().clamp(0.0, 100.0) as u8;
+            let row_weak  = row.downgrade();
+            let syncing_d = syncing_write.clone();
+            // Fire the actual IPC 200 ms after the last value change.
+            let id = glib::timeout_add_local(
+                std::time::Duration::from_millis(200),
+                move || {
+                    set_brightness(ac, val);
+                    if let Some(readback) = get_brightness(ac) {
+                        if readback != val {
+                            *syncing_d.borrow_mut() = true;
+                            if let Some(r) = row_weak.upgrade() {
+                                r.set_value(readback as f64);
+                            }
+                            *syncing_d.borrow_mut() = false;
+                        }
+                    }
+                    glib::ControlFlow::Break
+                },
+            );
+            *debounce.borrow_mut() = Some(id);
         });
 
         let syncing_poll = syncing.clone();
@@ -459,51 +485,50 @@ fn build_power_page(ac: bool, device: &SupportedDevice) -> gtk::ScrolledWindow {
         page.add(&group);
     }
 
-    // CPU Power Limits (PDL1/PDL2) — AC page only
-    if ac {
-        if let Some((pl1, pl2, pl1_max)) = get_power_limits() {
-            let tdp_base = if pl1_max > 0 { pl1_max } else { 55 };
-            let max_pl = (tdp_base * 4).max(pl1.max(pl2) + 20); // generous upper bound
+    // CPU Power Limits (RAPL) — per power profile, persisted across reboots
+    if let Some((pl1, pl2, pl1_max)) = get_power_limits(ac) {
+        let tdp_base = if pl1_max > 0 { pl1_max } else { 55 };
+        let max_pl = (tdp_base * 4).max(pl1.max(pl2) + 20);
 
-            let group = adw::PreferencesGroup::builder()
-                .title("CPU Power Limits (RAPL)")
-                .description("Intel PL1 (sustained) and PL2 (boost) — requires root daemon")
-                .build();
+        let rapl_group = adw::PreferencesGroup::builder()
+            .title("CPU Power Limits (RAPL)")
+            .description("Intel PL1 (sustained) and PL2 (boost). Lowering PL1 on battery limits turbo boost and extends runtime. Requires root daemon.")
+            .build();
 
-            let pl1_row = adw::SpinRow::with_range(tdp_base as f64, max_pl as f64, 5.0);
-            pl1_row.set_title("PL1 — Sustained (W)");
-            pl1_row.set_subtitle(&format!("Long-term power limit (base TDP: {tdp_base} W)"));
-            pl1_row.set_value(pl1 as f64);
+        let pl1_row = adw::SpinRow::with_range(tdp_base as f64, max_pl as f64, 5.0);
+        pl1_row.set_title("PL1 — Sustained (W)");
+        pl1_row.set_subtitle(&format!("Long-term power limit (base TDP: {tdp_base} W)"));
+        pl1_row.set_value(pl1 as f64);
 
-            let pl2_row = adw::SpinRow::with_range(tdp_base as f64, max_pl as f64, 5.0);
-            pl2_row.set_title("PL2 — Boost (W)");
-            pl2_row.set_subtitle("Short-term burst power limit");
-            pl2_row.set_value(pl2 as f64);
+        let pl2_row = adw::SpinRow::with_range(tdp_base as f64, max_pl as f64, 5.0);
+        pl2_row.set_title("PL2 — Boost (W)");
+        pl2_row.set_subtitle("Short-term burst power limit");
+        pl2_row.set_value(pl2 as f64);
 
-            let apply_btn = gtk::Button::builder()
-                .label("Apply Power Limits")
-                .halign(gtk::Align::Center)
-                .css_classes(["suggested-action", "pill"])
-                .build();
-            apply_btn.set_size_request(200, -1);
+        let apply_btn = gtk::Button::builder()
+            .label("Apply Power Limits")
+            .halign(gtk::Align::Center)
+            .css_classes(["suggested-action", "pill"])
+            .margin_top(16)
+            .build();
+        apply_btn.set_size_request(200, -1);
 
-            let pl1_ref = pl1_row.clone();
-            let pl2_ref = pl2_row.clone();
-            apply_btn.connect_clicked(move |_| {
-                let p1 = pl1_ref.value() as u32;
-                let p2 = pl2_ref.value() as u32;
-                set_power_limits(p1, p2);
-                if let Some((r1, r2, _)) = get_power_limits() {
-                    pl1_ref.set_value(r1 as f64);
-                    pl2_ref.set_value(r2 as f64);
-                }
-            });
+        let pl1_ref = pl1_row.clone();
+        let pl2_ref = pl2_row.clone();
+        apply_btn.connect_clicked(move |_| {
+            let p1 = pl1_ref.value() as u32;
+            let p2 = pl2_ref.value() as u32;
+            set_power_limits(ac, p1, p2);
+            if let Some((r1, r2, _)) = get_power_limits(ac) {
+                pl1_ref.set_value(r1 as f64);
+                pl2_ref.set_value(r2 as f64);
+            }
+        });
 
-            group.add(&pl1_row);
-            group.add(&pl2_row);
-            group.add(&apply_btn);
-            page.add(&group);
-        }
+        rapl_group.add(&pl1_row);
+        rapl_group.add(&pl2_row);
+        rapl_group.add(&apply_btn);
+        page.add(&rapl_group);
     }
 
     scroll.set_child(Some(&page));
@@ -791,7 +816,7 @@ fn build_keyboard_page() -> gtk::ScrolledWindow {
     scroll
 }
 
-fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
+fn build_system_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
@@ -800,7 +825,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
     let page = adw::PreferencesPage::new();
 
     if let Some(comms::DaemonResponse::GetGpuStatus {
-        name, temp_c, gpu_util, power_w, power_limit_w, power_max_limit_w,
+        name, temp_c, gpu_util, stale: _, power_w, power_limit_w, power_max_limit_w,
         mem_used_mb, mem_total_mb, clock_gpu_mhz, clock_mem_mhz, ..
     }) = send_data(comms::DaemonCommand::GetGpuStatus) {
         let gpu_expander = adw::ExpanderRow::builder()
@@ -841,10 +866,10 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
             power_w: f64,
         }
 
-        let history: Rc<RefCell<VecDeque<Sample>>> = Rc::new(RefCell::new(VecDeque::with_capacity(CHART_HISTORY + 1)));
-        let tgp_limit: Rc<RefCell<f64>> = Rc::new(RefCell::new(power_limit_w as f64));
+        let history: Arc<Mutex<VecDeque<Sample>>> = Arc::new(Mutex::new(VecDeque::with_capacity(CHART_HISTORY + 1)));
+        let tgp_limit: Arc<Mutex<f64>> = Arc::new(Mutex::new(power_limit_w as f64));
         {
-            let mut h = history.borrow_mut();
+            let mut h = history.lock().unwrap();
             h.push_back(Sample { temp_c: temp_c as f64, gpu_pct: gpu_util as f64, vram_pct: if mem_total_mb > 0 { mem_used_mb as f64 * 100.0 / mem_total_mb as f64 } else { 0.0 }, power_w: power_w as f64 });
         }
 
@@ -867,7 +892,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
             move |_da, cr: &gtk::cairo::Context, w: i32, h: i32| {
             let w = w as f64;
             let h = h as f64;
-            let hist = hist_draw.borrow();
+            let hist = hist_draw.lock().unwrap_or_else(|e| e.into_inner());
             let n = hist.len();
             if n < 2 { return; }
 
@@ -949,7 +974,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
             draw_line(&|i| hist_ref[i].power_w * (100.0 / 200.0), 0.3, 0.8, 1.0, 100.0);
 
             // TGP limit — dashed horizontal reference line
-            let tgp = *tgp_draw.borrow();
+            let tgp = *tgp_draw.lock().unwrap_or_else(|e| e.into_inner());
             if tgp > 0.0 {
                 let tgp_y = pad_t + ch * (1.0 - (tgp * (100.0 / 200.0)) / 100.0);
                 cr.set_source_rgba(0.3, 0.8, 1.0, 0.35);
@@ -985,8 +1010,8 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
         chart.set_draw_func(move |da, cr, w, h| draw_fn_c(da, cr, w, h));
 
         // CSV log file handle — None when logging is off, Some(file) when on.
-        // Shared between the toggle button handler and the 3-s poll timer below.
-        let csv_log: Rc<RefCell<Option<std::fs::File>>> = Rc::new(RefCell::new(None));
+        // Arc<Mutex<>> so it can be shared with the background poll thread.
+        let csv_log: Arc<Mutex<Option<std::fs::File>>> = Arc::new(Mutex::new(None));
 
         // Bottom button row: [Log CSV]  ·  ·  ·  [Pop Out]
         let btn_row = gtk::Box::builder()
@@ -1004,7 +1029,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
             .build();
         let csv_log_toggle = csv_log.clone();
         log_btn.connect_toggled(move |btn| {
-            let mut guard = csv_log_toggle.borrow_mut();
+            let mut guard = csv_log_toggle.lock().unwrap_or_else(|e| e.into_inner());
             if btn.is_active() {
                 let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
                 let log_dir = std::path::Path::new(&home).join(".local/share/razer-control");
@@ -1015,7 +1040,7 @@ fn build_about_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
                     if !file_exists {
                         use std::io::Write;
                         let mut fw = &f;
-                        let _ = writeln!(fw, "timestamp,power_limit_w,power_w,gpu_util,vram_pct,temp_c");
+                        let _ = writeln!(fw, "timestamp,power_limit_w,power_w,gpu_util,vram_pct,temp_c,stale");
                     }
                     *guard = Some(f);
                     btn.set_tooltip_text(Some(&format!("Logging → {}", log_path.display())));
@@ -1184,67 +1209,106 @@ for (var i = 0; i < wins.length; i++) {
         gpu_group.add(&gpu_expander);
         page.add(&gpu_group);     // 2. GPU info (collapsible, expanded)
 
-        // Poll every 3 seconds — update labels + chart
-        let hist_poll = history;
-        let tgp_poll = tgp_limit;
-        let chart_ref = chart;
-        let csv_poll = csv_log;
-        glib::timeout_add_seconds_local(3, glib::clone!(
-            #[weak] temp_label,
-            #[weak] usage_label,
-            #[weak] vram_label,
-            #[weak] power_label,
-            #[weak] tgp_label,
-            #[weak] clock_label,
-            #[weak] chart_ref,
-            #[upgrade_or] glib::ControlFlow::Break,
-            move || {
-                if let Some(comms::DaemonResponse::GetGpuStatus {
-                    temp_c, gpu_util, power_w, power_limit_w, power_max_limit_w,
-                    mem_used_mb, mem_total_mb, clock_gpu_mhz, clock_mem_mhz, ..
-                }) = send_data(comms::DaemonCommand::GetGpuStatus) {
-                    temp_label.set_text(&format!("{temp_c}°C"));
-                    usage_label.set_text(&format!("{gpu_util}%"));
-                    let mem_pct = if mem_total_mb > 0 { mem_used_mb * 100 / mem_total_mb } else { 0 };
-                    vram_label.set_text(&format!("{mem_used_mb}/{mem_total_mb} MiB ({mem_pct}%)"));
-                    power_label.set_text(&format!("{power_w:.1} W"));
-                    tgp_label.set_text(&format!("{power_limit_w:.0} W enforced / {power_max_limit_w:.0} W max"));
-                    clock_label.set_text(&format!("GPU {clock_gpu_mhz} / Mem {clock_mem_mhz} MHz"));
+        // ── Background GPU poll: IPC runs off the GTK main thread ──────────────────────────
+        // Struct for passing GPU data through the channel (must be Send).
+        #[derive(Clone, Copy)]
+        struct GpuSample {
+            temp_c: i32, gpu_util: u8, stale: bool,
+            power_w: f32, power_limit_w: f32, power_max_limit_w: f32,
+            mem_used_mb: u32, mem_total_mb: u32,
+            clock_gpu_mhz: u32, clock_mem_mhz: u32,
+        }
 
-                    *tgp_poll.borrow_mut() = power_limit_w as f64;
+        // mpsc channel: background thread → main thread.
+        // Receiver is !Send so it stays on the main thread (used in _local timer below).
+        let (gpu_tx, gpu_rx) = std::sync::mpsc::channel::<Option<GpuSample>>();
+        let poll_in_flight = Arc::new(AtomicBool::new(false));
+
+        // Timer: non-blocking try_recv on each tick + launch background IPC thread.
+        // Main thread never blocks: try_recv() is instant, thread::spawn() is instant.
+        {
+            let hist_t   = history.clone();
+            let tgp_t    = tgp_limit.clone();
+            let csv_t    = csv_log.clone();
+            let chart_t  = chart.clone();
+            let in_flight = poll_in_flight;
+            // Cloned strong refs — GLib releases the timer source (and these refs)
+            // when the main window closes.
+            let tl  = temp_label.clone();
+            let ul  = usage_label.clone();
+            let vl  = vram_label.clone();
+            let pl  = power_label.clone();
+            let tpl = tgp_label.clone();
+            let cl  = clock_label.clone();
+            glib::timeout_add_seconds_local(3, move || {
+                // 1. Consume any fresh data produced by the previous background thread.
+                if let Ok(Some(s)) = gpu_rx.try_recv() {
+                    tl.set_text(&format!("{}°C", s.temp_c));
+                    ul.set_text(&format!("{}%", s.gpu_util));
+                    let mem_pct = if s.mem_total_mb > 0 { s.mem_used_mb * 100 / s.mem_total_mb } else { 0 };
+                    vl.set_text(&format!("{}/{} MiB ({}%)", s.mem_used_mb, s.mem_total_mb, mem_pct));
+                    pl.set_text(&format!("{:.1} W", s.power_w));
+                    tpl.set_text(&format!("{:.0} W enforced / {:.0} W max", s.power_limit_w, s.power_max_limit_w));
+                    cl.set_text(&format!(
+                        "GPU {} / Mem {} MHz{}",
+                        s.clock_gpu_mhz, s.clock_mem_mhz,
+                        if s.stale { " · cached" } else { "" },
+                    ));
+                    *tgp_t.lock().unwrap_or_else(|e| e.into_inner()) = s.power_limit_w as f64;
                     let sample = Sample {
-                        temp_c: temp_c as f64,
-                        gpu_pct: gpu_util as f64,
-                        vram_pct: if mem_total_mb > 0 { mem_used_mb as f64 * 100.0 / mem_total_mb as f64 } else { 0.0 },
-                        power_w: power_w as f64,
+                        temp_c: s.temp_c as f64,
+                        gpu_pct: s.gpu_util as f64,
+                        vram_pct: if s.mem_total_mb > 0 { s.mem_used_mb as f64 * 100.0 / s.mem_total_mb as f64 } else { 0.0 },
+                        power_w: s.power_w as f64,
                     };
-                    {
-                        let mut h = hist_poll.borrow_mut();
+                    if !s.stale {
+                        let mut h = hist_t.lock().unwrap_or_else(|e| e.into_inner());
                         h.push_back(sample);
                         while h.len() > CHART_HISTORY { h.pop_front(); }
                     }
-                    // Append to CSV log if logging is enabled
-                    if let Some(ref mut f) = *csv_poll.borrow_mut() {
+                    if let Some(ref mut f) = *csv_t.lock().unwrap_or_else(|e| e.into_inner()) {
                         use std::io::Write;
                         let ts = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs();
-                        let _ = writeln!(f, "{ts},{power_limit_w:.1},{power_w:.1},{gpu_util},{:.1},{temp_c}",
-                            sample.vram_pct);
+                        let _ = writeln!(f, "{ts},{:.1},{:.1},{},{:.1},{},{}",
+                            s.power_limit_w, s.power_w, s.gpu_util, sample.vram_pct, s.temp_c,
+                            if s.stale { 1u8 } else { 0u8 });
                     }
-                    chart_ref.queue_draw();
+                    chart_t.queue_draw();
+                }
+                // 2. Launch next background IPC thread (skipped if one is already running).
+                if !in_flight.swap(true, Ordering::AcqRel) {
+                    let tx2       = gpu_tx.clone();
+                    let in_flight2 = in_flight.clone();
+                    std::thread::spawn(move || {
+                        let resp = comms::try_bind().ok()
+                            .and_then(|s| comms::send_to_daemon(comms::DaemonCommand::GetGpuStatus, s));
+                        in_flight2.store(false, Ordering::Release);
+                        let msg = match resp {
+                            Some(comms::DaemonResponse::GetGpuStatus {
+                                temp_c, gpu_util, stale, power_w, power_limit_w, power_max_limit_w,
+                                mem_used_mb, mem_total_mb, clock_gpu_mhz, clock_mem_mhz, ..
+                            }) => Some(GpuSample {
+                                temp_c, gpu_util, stale, power_w, power_limit_w, power_max_limit_w,
+                                mem_used_mb, mem_total_mb, clock_gpu_mhz, clock_mem_mhz,
+                            }),
+                            _ => None,
+                        };
+                        let _ = tx2.send(msg);
+                    });
                 }
                 glib::ControlFlow::Continue
-            }
-        ));
+            });
+        }
     }
 
-    // 3. System Information (collapsible, collapsed by default)
+    // 3. System Information
     {
         let sysinfo_expander = adw::ExpanderRow::builder()
             .title("System Information")
-            .expanded(false)
+            .expanded(true)
             .build();
 
         let add_info = |title: &str, value: &str| -> adw::ActionRow {
@@ -1253,8 +1317,7 @@ for (var i = 0; i < wins.length; i++) {
             row
         };
 
-        sysinfo_expander.add_row(&add_info("Device", &device.name));
-
+        // ── OS & hardware ─────────────────────────────────────────────
         let dmi_product = std::fs::read_to_string("/sys/devices/virtual/dmi/id/product_name")
             .unwrap_or_default().trim().to_string();
         let dmi_vendor = std::fs::read_to_string("/sys/devices/virtual/dmi/id/sys_vendor")
@@ -1262,13 +1325,55 @@ for (var i = 0; i < wins.length; i++) {
         let dmi_bios = std::fs::read_to_string("/sys/devices/virtual/dmi/id/bios_version")
             .unwrap_or_default().trim().to_string();
 
+        // OS name from /etc/os-release PRETTY_NAME
+        let os_name = std::fs::read_to_string("/etc/os-release").unwrap_or_default()
+            .lines()
+            .find(|l| l.starts_with("PRETTY_NAME="))
+            .map(|l| l.trim_start_matches("PRETTY_NAME=").trim_matches('"').to_string())
+            .unwrap_or_else(|| "Linux".into());
+
+        // Kernel version — first 3 fields of /proc/version_signature, else first field of /proc/version
+        let kernel = std::fs::read_to_string("/proc/version").unwrap_or_default();
+        let kernel_version = kernel.split_whitespace().nth(2).unwrap_or("unknown").to_string();
+
+        // CPU model from /proc/cpuinfo
+        let cpu_model = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default()
+            .lines()
+            .find(|l| l.starts_with("model name"))
+            .and_then(|l| l.split(':').nth(1))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "unknown".into());
+
+        // Core count
+        let cpu_cores: usize = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default()
+            .lines()
+            .filter(|l| l.starts_with("processor"))
+            .count();
+
+        // RAM from /proc/meminfo
+        let ram_kb: u64 = std::fs::read_to_string("/proc/meminfo").unwrap_or_default()
+            .lines()
+            .find(|l| l.starts_with("MemTotal:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let ram_gb = ram_kb / (1024 * 1024);
+        let ram_str = if ram_gb > 0 { format!("{ram_gb} GiB") } else { format!("{} MiB", ram_kb / 1024) };
+
         if !dmi_product.is_empty() {
             let host = if dmi_vendor.is_empty() { dmi_product } else { format!("{dmi_vendor} {dmi_product}") };
             sysinfo_expander.add_row(&add_info("Host", &host));
         }
+        sysinfo_expander.add_row(&add_info("OS", &os_name));
+        sysinfo_expander.add_row(&add_info("Kernel", &kernel_version));
+        sysinfo_expander.add_row(&add_info("Processor", &format!("{cpu_model} × {cpu_cores}")));
+        sysinfo_expander.add_row(&add_info("Memory", &ram_str));
+        if !dmi_bios.is_empty() { sysinfo_expander.add_row(&add_info("BIOS", &dmi_bios)); }
+
+        // ── Razer device ──────────────────────────────────────────────
+        sysinfo_expander.add_row(&add_info("Device", &device.name));
         sysinfo_expander.add_row(&add_info("USB ID", &format!("{}:{}", device.vid, device.pid)));
         sysinfo_expander.add_row(&add_info("Features", &device.features.join(", ")));
-        if !dmi_bios.is_empty() { sysinfo_expander.add_row(&add_info("BIOS", &dmi_bios)); }
         sysinfo_expander.add_row(&add_info("Fan Range", &format!("{} – {} RPM",
             device.fan.first().unwrap_or(&0), device.fan.get(1).unwrap_or(&0))));
 

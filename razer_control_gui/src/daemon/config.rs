@@ -15,6 +15,12 @@ pub struct PowerConfig {
     pub logo_state: u8,
     pub screensaver: bool, // turno of keyboard light if screen is blank
     pub idle: u32,
+    /// RAPL PL1 (sustained) in watts. 0 = not configured — let firmware manage.
+    #[serde(default)]
+    pub rapl_pl1_watts: u32,
+    /// RAPL PL2 (boost) in watts. 0 = not configured.
+    #[serde(default)]
+    pub rapl_pl2_watts: u32,
 }
 
 impl PowerConfig {
@@ -28,6 +34,8 @@ impl PowerConfig {
             logo_state: 0,
             screensaver: false,
             idle: 0,
+            rapl_pl1_watts: 0,
+            rapl_pl2_watts: 0,
         }
     }
 }

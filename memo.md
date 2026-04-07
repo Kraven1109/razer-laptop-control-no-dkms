@@ -85,47 +85,63 @@ receives them → updates `enforced.power.limit`.
 
 ## Display Flickering Root Causes & Fixes
 
-### Root Cause 1 — Intel PSR + Panel Replay (PSR successor on Raptor Lake)
-Intel PSR2 and its successor **Panel Replay** (eDP 1.5, separate `enable_panel_replay` flag)
-selectively refresh regions of the eDP panel. `enable_psr=0` alone does NOT disable Panel Replay.
-**Fix (permanent, needs reboot):**
+### Current diagnosis (April 2026)
+There were at least two overlapping causes, and they need to be kept separate.
+
+### Root Cause 1 — Daemon-side `nvidia-smi` / NVML mutex stalls on PRIME (fixed in project)
+`nvidia-smi` can grab the NVIDIA driver's global mutex long enough to block the PRIME DMA
+completion fence. On this machine that produced KWin pageflip timeouts around 1.3-1.5 s and a
+visible black-frame flicker.
+
+**Project fixes now in place:**
+- Two-track guard in `daemon.rs::start_gpu_load_monitor_task()`:
+  - Gaming path: arm instantly from `/dev/dri/renderD128` fd growth, with zero `nvidia-smi`
+  - CUDA / ComfyUI path: arm early at 30% util, then hold for 120 s with no extra NVML call
+- `GetGpuStatus` no longer bypasses the guard with an on-demand `nvidia-smi`
+- GUI/CLI/CSV now label held telemetry as cached, and the GUI chart skips stale held samples
+
+### Root Cause 2 — Internal eDP HDR / WCG / EDR / 10-bit path in hybrid mode (investigation closed in this project)
+Testing showed KWin pageflip timeouts still occurring while the flicker guard was already active,
+meaning the remaining flicker is not coming from the daemon's `nvidia-smi` path.
+
+Observed internal panel state during the residual issue:
+- 3840x2400 @ 120 Hz
+- HDR enabled
+- Wide Color Gamut enabled
+- Allow EDR = always
+- 10 bits per color
+
+Evidence gathered:
+- External USB-C display does not show the same flicker under the same workload
+- Disabling HDR on the built-in panel reduced flicker during the same ~108 s ComfyUI run
+- **Updated (Session 5):** After wakeup from sleep, flickering still occurs even with HDR
+  disabled, under heavy GPU workload. HDR state no longer makes a clear difference after resume.
+
+**Decision:** Root Cause 2 (eDP pipeline / post-sleep flicker) is **out of scope for this project**.
+Deep investigation will be done in a separate dedicated project.  This project focuses on
+daemon-side power management and the keyboard control stack.
+
+### Secondary contributor still worth keeping — Intel panel power features
+Intel PSR2 / Panel Replay / related panel power-saving paths can still worsen eDP behavior.
+`enable_psr=0` alone does NOT disable Panel Replay.
+
+**Configured system-side mitigation (needs reboot):**
 ```
 options i915 enable_psr=0 enable_fbc=0 enable_dc=0 enable_panel_replay=0
 ```
-Written to `/etc/modprobe.d/i915-flicker.conf` in Session 3.
 
-### Root Cause 2 — EC interrupt contention with NVPCF Dynamic Boost
-NVIDIA Dynamic Boost (NVPCF2) sends ~1 Hz power budget adjustment packets via the EC.
-Our keyboard animation also sends USB HID packets to the same EC. When both happen at the
-same time under peak GPU load, the EC IRQ handler can stall the PRIME display pipeline.
+### Secondary contributor still worth keeping — NVIDIA D3cold wake latency
+ComfyUI's bursty idle gaps can still make D3cold wake latency visible if runtime PM is too aggressive.
 
-**Mitigation in daemon (`daemon.rs` `start_gpu_load_monitor_task`):**
-- At GPU util ≥ 70%: keyboard animation slowed from 100 ms → 333 ms (3 FPS)
-- Near TGP (≥ 94% of `enforced.power.limit` at ≥ 60% GPU util): animation frozen entirely
-  (`HIGH_POWER_FLICKER_GUARD = true`, animator loop sleeps 1000 ms)
-- Hysteresis: guard releases only when power drops below 88% of TGP at util < 40%
-- Thresholds are **percentage-based** (not absolute W) so they work in every profile.
-
-### Root Cause 3 — Daemon calling `nvidia-smi` every 3 s on battery
-nvidia-smi spawns a subprocess that wakes the dGPU from D3cold.  On battery this prevents
-the GPU from staying suspended, which activates the PRIME display pipeline continuously.
-**Fix:** `gpu::should_query_nvidia(on_ac)` — skips nvidia-smi when `runtime_status == "suspended"`.
-
-### Root Cause 4 — NVIDIA D3cold wakeup latency during ComfyUI burst pattern
-`NVreg_DynamicPowerManagement=0x03` (fine-grained PM) allows GPU to enter D3cold during
-the ~9 s idle gaps **between** ComfyUI inference steps. Wakeup from D3cold takes 200–500 ms,
-stalling the PRIME frame pipeline → visible black frame / flicker at the start of each step.
-
-**Fix (permanent, immediate):**
+**Pinned-on workaround that was tested:**
 ```
 /etc/udev/rules.d/99-nvidia-no-d3cold.rules:
 ACTION=="add",    SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x030000", ATTR{power/control}="on"
 ACTION=="bind",   SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x030000", ATTR{power/control}="on"
 ACTION=="change", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x030000", ATTR{power/control}="on"
 ```
-Rule number 99 fires AFTER `71-nvidia.rules` and `80-nvidia-pm.rules` (both set "auto" on add/bind).
-Also applied immediately: `echo on > /sys/bus/pci/devices/0000:01:00.0/power/control`
-GPU idle power: ~15 W instead of ~0 W while system is running. S3 sleep is unaffected.
+This keeps the dGPU out of D3cold while the system is running. It is still a secondary mitigation,
+not the best explanation for the remaining HDR-sensitive flicker.
 
 ---
 
@@ -135,7 +151,8 @@ GPU idle power: ~15 W instead of ~0 W while system is running. S3 sleep is unaff
 - `NVIDIA_RUNTIME_STATUS_PATH`: lazy-static sysfs path for `/sys/bus/pci/devices/<NVIDIA>/power/runtime_status`
 - `should_query_nvidia(on_ac)`: returns `false` on battery when GPU is suspended
 - `GPU_STATUS_CACHE`: mutex-guarded last-good `GpuStatus`; served to `GetGpuStatus` handler without spawning a new nvidia-smi per GUI poll
-- `clear_gpu_cache()`: called on profile switch, AC state change, and on_ac → battery
+- `store_gpu_cache()` / `get_cached_gpu_status()` / `clear_gpu_cache()`: standard cache lifecycle
+- `start_gpu_load_monitor_task()`: simple poller — polls nvidia-smi every 3 s (AC) / 10 s (battery), stores result in cache. Anti-flicker guard logic has been REMOVED (see Archived section below).
 
 ### Profile switch → TGP update latency
 On profile switch, the daemon:
@@ -240,7 +257,8 @@ razer-cli pdl        # CPU RAPL PL1/PL2
 | `i915 enable_psr=0` | **Needs reboot** | In initramfs via `/etc/modprobe.d/i915-flicker.conf` |
 | `NVreg_DynamicPowerManagement=0x03` | **Needs reboot** | In `/etc/modprobe.d/nvidia-power.conf` |
 | Raptor Lake duplicate-eDP VBT bug | **If PSR fix insufficient** | Install `intel-gpu-tools` (AUR), decode VBT, patch LFP2 entry, add `i915.vbt_firmware=i915/modified.vbt` |
-| AC heavy-load flicker | **Needs post-reboot test** | Flicker guard active; if still occurs, escalate to VBT fix |
+| Internal-panel HDR flicker | **Out of scope — moved to dedicated project** | Post-sleep flicker persists even with HDR disabled; investigating in a separate project |
+| AC heavy-load flicker | **Reduced from daemon side** | Guard blocks extra `nvidia-smi`; residual eDP path under investigation externally |
 
 ---
 
@@ -283,3 +301,83 @@ cargo build --release 2>&1 | tail -5
 - `comms.rs`: `GetCurrentEffect` command + `GetCurrentEffect { name, args }` response added
 - `daemon.rs`: `GetCurrentEffect` handler implemented
 - `razer-settings.rs`: `get_current_effect()` function; `build_keyboard_page()` restores effect index, both color wheels, speed/direction/density/duration on startup
+
+### Session 4 — PRIME guard rewrite + HDR/eDP diagnosis
+- Reworked the GPU guard into two tracks:
+  - gaming detection from `renderD128` fd growth
+  - CUDA / ComfyUI detection from early 30% util arm
+- Guard hold and periodic check both extended to 120 s to cover long ComfyUI runs without reintroducing NVML stalls mid-job
+- `GetGpuStatus` now respects the guard and never sneaks in an extra `nvidia-smi`
+- Added stale telemetry propagation through daemon, GUI, CLI, and CSV log
+- Verified from journal that residual KWin pageflip timeouts still occurred while the guard was already active
+- New dominant hypothesis confirmed by testing: internal panel HDR / WCG / EDR / 10-bit path is the main remaining flicker source; disabling HDR massively reduces the issue, while external USB-C display path stays clean
+
+### Session 5 — Post-sleep flicker diagnosis + GUI robustness + guard removal
+- **Flicker finding (Session 5):** After wakeup from sleep, flickering still occurs with HDR disabled
+  under heavy GPU workload. The eDP flicker issue is no longer connected to HDR state alone. Root
+  Cause 2 is now classified as **out of scope** for this project — a dedicated project will be used
+  for deep investigation.
+- **All PRIME anti-flicker guard code removed from this project** (see "Archived" section below).
+- **GUI robustness:**
+  - `comms.rs`: added 1 500 ms read timeout + 1 000 ms write timeout on every IPC socket call —
+    prevents the GTK main thread from blocking indefinitely when the daemon is slow (e.g. after
+    sleep/resume).
+  - `send_data()`: no longer crashes the GUI on `ENOENT` (daemon socket briefly absent after
+    daemon restart); returns `None` gracefully instead.
+  - GPU chart poll (System page): moved daemon IPC off the GTK main thread via
+    `glib::MainContext::channel` + `std::thread::spawn`. An `Arc<AtomicBool>` in-flight guard
+    prevents thread pile-up when the daemon is slow. The chart and labels now update via the
+    channel callback on the main thread — the main loop is never blocked.
+  - Shared chart data (`history`, `tgp_limit`, CSV file handle) converted from
+    `Rc<RefCell<...>>` to `Arc<Mutex<...>>` to allow safe cross-thread access.
+  - Keyboard brightness slider: debounced with a 200 ms `glib::timeout_add_local` timer — rapid
+    scrolling no longer fires one blocking IPC call per step.
+- **UI/UX:**
+  - "About" tab renamed to "System" with `computer-symbolic` icon.
+  - CPU Power Limits (RAPL PL1/PL2) moved from AC-only page to System tab — now accessible
+    regardless of AC state, enabling battery users to cap turbo boost for longer runtime.
+  - Apply button given `margin_top: 16` for clear visual separation from the spin rows.
+  - `start_gpu_load_monitor_task()` simplified to a clean 3 s / 10 s cache-refresh poller.
+
+---
+
+## Archived — PRIME Anti-Flicker Guard Design (removed Session 5)
+
+This guard was built to reduce EC interrupt contention between NVIDIA NVPCF Dynamic Boost
+and HID traffic during heavy PRIME workloads (ComfyUI, games).  Later testing showed it did
+not eliminate the residual KWin pageflip timeouts when the internal eDP HDR path was active.
+The design is documented here for the dedicated flicker investigation project.
+
+### Problem modelled
+`nvidia-smi` acquires the NVIDIA driver's global mutex.  When held, the PRIME DMA completion
+fence is blocked.  VS Code, Edge, and the GUI all render on `renderD128` (NVIDIA) and those
+frames are PRIME-copied to Intel for KWin — so there is always a PRIME fence in flight.  At
+≥ 60 % GPU util the mutex hold can exceed 1 368 ms, triggering i915's "Pageflip timed out!"
+bug → 1-second blank screen.
+
+### Two-track ARM logic
+- **Track A — Gaming** (new `/dev/dri/renderD128` fd delta from `count_nvidia_render_fds()`):
+  count increase > baseline + 2 → ARM guard instantly, ZERO `nvidia-smi`, no NVML stall.
+- **Track B — CUDA / ComfyUI** (util threshold at low load):
+  CUDA never opens `renderD128`. `nvidia-smi` is called at a LOW threshold (30 %) during
+  model loading when the driver is lightly loaded and the mutex hold < 200 ms.
+
+### Guard hold logic
+- `GUARD_HOLD_MS = 120_000`: no `nvidia-smi` for first 2 min after ARM.
+- `GUARD_POLL_MS = 120_000`: then periodic check every 2 min.
+- `RELEASE_UTIL = 15 %`: release guard when util drops below this.
+- `ARM_UTIL = 30 %`: arm from CUDA track at this threshold.
+- While armed: `ANIM_SLEEP_MS = 600_000` (freeze animation) and
+  `HIGH_POWER_FLICKER_GUARD = true`.
+
+### Stale telemetry
+When the guard was armed, `GPU_STATUS_CACHE_UPDATED_MS` tracked the last real NVML refresh.
+Samples older than 6 s were marked `stale = true` in `DaemonResponse::GetGpuStatus`, causing:
+- GUI chart: stale samples skipped (flat lines suppressed)
+- CSV: `stale` column = 1
+- Clock label: ` · cached` suffix
+- CLI: ` (cached)` suffix on GPU name
+
+### Key atomics (all removed)
+`HIGH_POWER_FLICKER_GUARD`, `GUARD_ENTERED_MS`, `GUARD_ENTRY_TGP`,
+`GUARD_LAST_CHECK_MS`, `RENDER128_BASELINE`, `ANIM_SLEEP_MS`

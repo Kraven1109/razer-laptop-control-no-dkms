@@ -8,8 +8,8 @@ use lazy_static::lazy_static;
 lazy_static! {
     /// Most recent GPU snapshot taken by the GPU load monitor.
     /// The GUI's GetGpuStatus handler reads from this cache so that only one
-    /// nvidia-smi subprocess is spawned per 5-second monitor cycle rather than
-    /// once per 3-second GUI poll.
+    /// nvidia-smi subprocess is spawned per poll cycle rather than once per
+    /// GUI tick.
     static ref GPU_STATUS_CACHE: Mutex<Option<GpuStatus>> = Mutex::new(None);
     /// sysfs runtime_status path for the NVIDIA dGPU, used to avoid waking the
     /// device on battery just to discover that it is already suspended.
@@ -52,34 +52,6 @@ pub fn clear_gpu_cache() {
 /// Return the most recently cached GPU status without spawning nvidia-smi.
 pub fn get_cached_gpu_status() -> Option<GpuStatus> {
     GPU_STATUS_CACHE.lock().ok().and_then(|g| g.clone())
-}
-
-/// Count the number of file-descriptor symlinks in `/proc/*/fd/` that point to
-/// `/dev/dri/renderD128` (the NVIDIA DRM render node on this system).
-///
-/// At rest the baseline is VS Code + Edge + razer-settings = ~4 fds.
-/// When a game or other PRIME-offloaded app starts, the count increases.
-/// Reading /proc symlinks does NOT acquire any NVIDIA driver lock and takes
-/// only a few milliseconds, making it safe to call on every GPU monitor tick.
-pub fn count_nvidia_render_fds() -> usize {
-    let Ok(procs) = fs::read_dir("/proc") else { return 0 };
-    let mut count = 0usize;
-    for proc_entry in procs.flatten() {
-        // Only entries that look like PIDs (pure digits)
-        if !proc_entry.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let fd_dir = proc_entry.path().join("fd");
-        let Ok(fds) = fs::read_dir(&fd_dir) else { continue };
-        for fd in fds.flatten() {
-            if let Ok(target) = fs::read_link(fd.path()) {
-                if target.to_string_lossy() == "/dev/dri/renderD128" {
-                    count += 1;
-                }
-            }
-        }
-    }
-    count
 }
 
 /// Returns true when it is reasonable to query nvidia-smi.
