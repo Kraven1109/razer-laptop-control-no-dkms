@@ -211,8 +211,10 @@ pub fn start_gpu_load_monitor_task() -> JoinHandle<()> {
     thread::spawn(|| {
         // Do one query immediately so the cache is populated before the first
         // GUI poll arrives (which may happen within a second of startup).
-        if let Some(status) = gpu::query_nvidia_gpu() {
-            gpu::store_gpu_cache(&status);
+        if gpu::should_query_nvidia(gpu_monitor_on_ac()) {
+            if let Some(status) = gpu::query_nvidia_gpu() {
+                gpu::store_gpu_cache(&status);
+            }
         }
 
         loop {
@@ -220,6 +222,7 @@ pub fn start_gpu_load_monitor_task() -> JoinHandle<()> {
             thread::sleep(std::time::Duration::from_secs(if on_ac { 3 } else { 10 }));
 
             if SYSTEM_SLEEPING.load(Ordering::Relaxed) {
+                gpu::clear_gpu_cache();
                 continue;
             }
             if !gpu::should_query_nvidia(on_ac) {
@@ -709,7 +712,9 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                     temp_c: status.temp_c,
                     gpu_util: status.gpu_util,
                     mem_util: status.mem_util,
-                    stale: false,
+                    stale: status.power_w <= 0.0
+                        && status.clock_gpu_mhz == 0
+                        && status.clock_mem_mhz == 0,
                     power_w: status.power_w,
                     power_limit_w: status.power_limit_w,
                     power_max_limit_w: status.power_max_limit_w,

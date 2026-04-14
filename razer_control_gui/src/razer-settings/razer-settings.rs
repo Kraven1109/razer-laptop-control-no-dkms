@@ -1780,6 +1780,8 @@ for (var i = 0; i < wins.length; i++) {
                         while h.len() > CHART_HISTORY {
                             h.pop_front();
                         }
+                    } else {
+                        hist_t.lock().unwrap_or_else(|e| e.into_inner()).clear();
                     }
                     if let Some(ref mut f) = *csv_t.lock().unwrap_or_else(|e| e.into_inner()) {
                         use std::io::Write;
