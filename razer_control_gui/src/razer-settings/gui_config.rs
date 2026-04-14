@@ -32,6 +32,12 @@ pub struct GuiConfig {
     pub last_page: String,
     #[serde(default)]
     pub run_at_startup: bool,
+    #[serde(default = "default_start_minimized")]
+    pub start_minimized: bool,
+}
+
+fn default_start_minimized() -> bool {
+    true
 }
 
 impl Default for GuiConfig {
@@ -39,6 +45,7 @@ impl Default for GuiConfig {
         Self {
             last_page: default_page(),
             run_at_startup: false,
+            start_minimized: default_start_minimized(),
         }
     }
 }

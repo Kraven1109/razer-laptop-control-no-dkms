@@ -81,6 +81,13 @@ pub enum DaemonCommand {
     GetCurrentEffect,
     /// Live fan RPM from the EC tachometer (model-agnostic).
     GetFanTachometer,
+    SetFanTemperatureTarget {
+        ac: usize,
+        temp_c: i32,
+    },
+    GetFanTemperatureTarget {
+        ac: usize,
+    },
     SetLowBatteryLighting {
         threshold_pct: f64,
     },
@@ -183,6 +190,12 @@ pub enum DaemonResponse {
     GetFanTachometer {
         rpm: i32,
     },
+    SetFanTemperatureTarget {
+        result: bool,
+    },
+    GetFanTemperatureTarget {
+        temp_c: i32,
+    },
     SetLowBatteryLighting {
         result: bool,
     },
@@ -215,8 +228,18 @@ pub fn try_bind() -> std::io::Result<UnixStream> {
 #[allow(dead_code)]
 pub fn create() -> Option<UnixListener> {
     if let Ok(_) = std::fs::metadata(SOCKET_PATH) {
-        eprintln!("UNIX Socket already exists. Is another daemon running?");
-        return None;
+        match UnixStream::connect(SOCKET_PATH) {
+            Ok(_) => {
+                eprintln!("UNIX Socket already exists. Is another daemon running?");
+                return None;
+            }
+            Err(_) => {
+                if let Err(error) = std::fs::remove_file(SOCKET_PATH) {
+                    eprintln!("Could not remove stale UNIX socket: {error}");
+                    return None;
+                }
+            }
+        }
     }
     if let Ok(listener) = UnixListener::bind(SOCKET_PATH) {
         let mut perms = std::fs::metadata(SOCKET_PATH).unwrap().permissions();

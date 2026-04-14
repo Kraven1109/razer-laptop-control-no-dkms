@@ -252,6 +252,14 @@ impl DeviceManager {
 
     pub fn set_fan_rpm(&mut self, ac: usize, rpm: i32) -> bool {
         let rpm = rpm.max(0);
+        if let Some(config) = self.get_config() {
+            if config.power[ac.min(1)].temp_target_c != 0 {
+                config.power[ac.min(1)].temp_target_c = 0;
+                if let Err(error) = config.write_to_file() {
+                    error!("Config write error (fan temp target clear): {:?}", error);
+                }
+            }
+        }
         // Store session-only override — do NOT persist to config so a crash
         // cannot leave the fan stuck at a manual RPM after restart.
         self.fan_overrides[ac.min(1)] = rpm;
@@ -264,6 +272,19 @@ impl DeviceManager {
             }
         }
         return true;
+    }
+
+    pub fn apply_runtime_fan_rpm(&mut self, ac: usize, rpm: i32) -> bool {
+        let rpm = rpm.max(0);
+        self.fan_overrides[ac.min(1)] = rpm;
+        if let Some(laptop) = self.get_device() {
+            let state = laptop.get_ac_state();
+            if state != ac {
+                return true;
+            }
+            return laptop.set_fan_rpm(rpm as u16);
+        }
+        true
     }
 
     pub fn set_logo_led_state(&mut self, ac: usize, logo_state: u8) -> bool {
@@ -470,6 +491,44 @@ impl DeviceManager {
             return true;
         }
         false
+    }
+
+    pub fn set_temp_target(&mut self, ac: usize, temp_c: i32) -> bool {
+        let ac = ac.min(1);
+        let temp_c = if temp_c <= 0 { 0 } else { temp_c.clamp(60, 95) };
+
+        if let Some(config) = self.get_config() {
+            config.power[ac].temp_target_c = temp_c;
+            if let Err(error) = config.write_to_file() {
+                error!("Config write error (fan temp target): {:?}", error);
+                return false;
+            }
+        }
+
+        self.fan_overrides[ac] = 0;
+
+        if let Some(laptop) = self.get_device() {
+            if laptop.get_ac_state() == ac {
+                return laptop.set_fan_rpm(0);
+            }
+        }
+
+        true
+    }
+
+    pub fn get_temp_target(&mut self, ac: usize) -> i32 {
+        self.get_ac_config(ac.min(1))
+            .map(|config| config.temp_target_c.max(0))
+            .unwrap_or(0)
+    }
+
+    pub fn get_fan_range(&mut self) -> (i32, i32) {
+        if let Some(laptop) = self.get_device() {
+            if laptop.fan.len() >= 2 {
+                return (laptop.fan[0] as i32, laptop.fan[1] as i32);
+            }
+        }
+        (3500, 5000)
     }
 
     pub fn get_low_battery_lighting_threshold(&mut self) -> f64 {

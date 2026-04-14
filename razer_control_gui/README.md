@@ -142,7 +142,7 @@ Autostart is now managed from the GUI under `System -> Desktop Integration`.
 
 **Start minimized to tray** (useful for autostart):
 ```bash
-razer-settings --minimized   # or: razer-settings -m
+env RAZER_SETTINGS_START_MINIMIZED=1 razer-settings
 ```
 Add this to KDE Autostart / systemd user service to have the GUI live in the tray
 without showing a window on login.

@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 
+require_sudo() {
+    if ! sudo -v; then
+        echo "Sudo authentication is required to install system files"
+        exit 1
+    fi
+}
+
 detect_init_system() {
     if pidof systemd 1>/dev/null 2>/dev/null; then
         INIT_SYSTEM="systemd"
@@ -11,6 +18,8 @@ detect_init_system() {
 }
 
 install() {
+    require_sudo
+
     echo "Building the project..."
     cargo build --release # TODO: The GUI should be optional. At least for now. Before releasing this, it sould be turned into a feature with an explicit cli switch to install it
 
@@ -34,15 +43,19 @@ install() {
     echo "Installing the files..."
     mkdir -p ~/.local/share/razercontrol
     sudo bash <<EOF
+        set -e
         mkdir -p /usr/share/razercontrol
-        cp target/release/razer-cli /usr/bin/
-        cp target/release/razer-settings /usr/bin/
+        install -Dm755 target/release/razer-cli /usr/bin/razer-cli.new
+        mv -f /usr/bin/razer-cli.new /usr/bin/razer-cli
+        install -Dm755 target/release/razer-settings /usr/bin/razer-settings.new
+        mv -f /usr/bin/razer-settings.new /usr/bin/razer-settings
         if ls /usr/share/applications/*.desktop 1> /dev/null 2>&1; then
             # We only install the desktop file if there are already desktop
             # files on the system
             cp data/gui/razer-settings.desktop /usr/share/applications/
         fi
-        cp target/release/daemon /usr/share/razercontrol/
+        install -Dm755 target/release/daemon /usr/share/razercontrol/daemon.new
+        mv -f /usr/share/razercontrol/daemon.new /usr/share/razercontrol/daemon
         cp data/devices/laptops.json /usr/share/razercontrol/
         cp data/udev/99-hidraw-permissions.rules /etc/udev/rules.d/
         mkdir -p /usr/share/icons/hicolor/scalable/apps
@@ -61,6 +74,7 @@ EOF
     case $INIT_SYSTEM in
     systemd)
         sudo cp data/services/systemd/razercontrol.service /etc/systemd/user/
+        systemctl --user daemon-reload
         systemctl --user enable --now razercontrol
         ;;
     openrc)
@@ -81,9 +95,12 @@ EOF
 }
 
 uninstall() {
+    require_sudo
+
     # Remove the files
     echo "Uninstalling the files..."
     sudo bash <<EOF
+        set -e
         rm -f /usr/bin/razer-cli
         rm -f /usr/bin/razer-settings
         rm -f /usr/share/applications/razer-settings.desktop
@@ -106,11 +123,14 @@ EOF
     systemd)
         systemctl --user disable --now razercontrol
     sudo bash <<EOF
+        set -e
         rm -f /etc/systemd/user/razercontrol.service
 EOF
+        systemctl --user daemon-reload
         ;;
     openrc)
         sudo bash <<EOF
+            set -e
             rc-service razercontrol stop
             rc-update del razercontrol default
             rm -f /etc/init.d/razercontrol

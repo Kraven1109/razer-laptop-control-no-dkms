@@ -41,10 +41,34 @@ lazy_static! {
     static ref LAST_BATTERY_PERCENT: Mutex<f64> = Mutex::new(100.0);
 }
 
+#[derive(Clone, Copy)]
+struct TempFanController {
+    prev_temp: f32,
+    integral: f32,
+    smoothed_temp: f32,
+    smoothed_util: f32,
+    thermal_energy: f32,
+    last_update: std::time::Instant,
+}
+
+impl Default for TempFanController {
+    fn default() -> Self {
+        Self {
+            prev_temp: 0.0,
+            integral: 0.0,
+            smoothed_temp: 0.0,
+            smoothed_util: 0.0,
+            thermal_energy: 0.0,
+            last_update: std::time::Instant::now(),
+        }
+    }
+}
+
 // Main function for daemon
 fn main() {
     setup_panic_hook();
     init_logging();
+    let mut initial_low_battery: Option<(f64, bool)> = None;
 
     if let Ok(mut d) = DEV_MANAGER.lock() {
         d.discover_devices();
@@ -99,7 +123,7 @@ fn main() {
             );
             if let Ok(percentage) = proxy_battery.percentage() {
                 store_last_battery_percent(percentage);
-                apply_low_battery_lighting(percentage, online);
+                initial_low_battery = Some((percentage, online));
             }
         } else {
             println!("error getting current power state");
@@ -107,8 +131,13 @@ fn main() {
         }
     }
 
+    if let Some((percentage, online)) = initial_low_battery {
+        apply_low_battery_lighting(percentage, online);
+    }
+
     start_keyboard_animator_task();
     start_gpu_load_monitor_task();
+    start_temp_fan_control_task();
     start_screensaver_monitor_task();
     start_battery_monitor_task();
     let clean_thread = start_shutdown_task();
@@ -199,6 +228,72 @@ pub fn start_gpu_load_monitor_task() -> JoinHandle<()> {
             }
             if let Some(status) = gpu::query_nvidia_gpu() {
                 gpu::store_gpu_cache(&status);
+            }
+        }
+    })
+}
+
+pub fn start_temp_fan_control_task() -> JoinHandle<()> {
+    thread::spawn(|| {
+        let mut controllers = [TempFanController::default(), TempFanController::default()];
+
+        loop {
+            thread::sleep(std::time::Duration::from_secs(1));
+
+            if SYSTEM_SLEEPING.load(Ordering::Relaxed) {
+                continue;
+            }
+
+            let mut manager = match DEV_MANAGER.lock() {
+                Ok(manager) => manager,
+                Err(error) => {
+                    error!("DEV_MANAGER lock failed in temp fan controller: {}", error);
+                    continue;
+                }
+            };
+
+            let current_ac = manager
+                .get_device()
+                .map(|laptop| laptop.get_ac_state())
+                .unwrap_or(1)
+                .min(1);
+            let target = manager.get_temp_target(current_ac);
+            if target <= 0 {
+                controllers[current_ac] = TempFanController::default();
+                continue;
+            }
+
+            let (min_rpm, max_rpm) = manager.get_fan_range();
+            let current_rpm = manager
+                .get_fan_tachometer()
+                .max(manager.get_fan_rpm(current_ac));
+
+            let cpu_temp_c = read_cpu_package_temp_c();
+            let gpu_status = gpu::get_cached_gpu_status();
+            let gpu_temp_c = gpu_status.as_ref().map(|status| status.temp_c as f32);
+            let gpu_util = gpu_status
+                .as_ref()
+                .map(|status| status.gpu_util as f32)
+                .unwrap_or(0.0);
+
+            let raw_temp = cpu_temp_c
+                .into_iter()
+                .chain(gpu_temp_c.into_iter())
+                .fold(0.0_f32, f32::max);
+            if raw_temp <= 0.0 {
+                continue;
+            }
+
+            if let Some(next_rpm) = compute_temp_target_rpm(
+                &mut controllers[current_ac],
+                raw_temp,
+                gpu_util,
+                target,
+                current_rpm.max(0) as f32,
+                min_rpm as f32,
+                max_rpm as f32,
+            ) {
+                let _ = manager.apply_runtime_fan_rpm(current_ac, next_rpm);
             }
         }
     })
@@ -434,6 +529,11 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                     result: d.set_fan_rpm(ac, rpm),
                 })
             }
+            comms::DaemonCommand::SetFanTemperatureTarget { ac, temp_c } => {
+                Some(comms::DaemonResponse::SetFanTemperatureTarget {
+                    result: d.set_temp_target(ac, temp_c),
+                })
+            }
             comms::DaemonCommand::SetLogoLedState { ac, logo_state } => {
                 Some(comms::DaemonResponse::SetLogoLedState {
                     result: d.set_logo_led_state(ac, logo_state),
@@ -473,6 +573,11 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
             comms::DaemonCommand::GetFanSpeed { ac } => Some(comms::DaemonResponse::GetFanSpeed {
                 rpm: d.get_fan_rpm(ac),
             }),
+            comms::DaemonCommand::GetFanTemperatureTarget { ac } => {
+                Some(comms::DaemonResponse::GetFanTemperatureTarget {
+                    temp_c: d.get_temp_target(ac),
+                })
+            }
             comms::DaemonCommand::GetPwrLevel { ac } => Some(comms::DaemonResponse::GetPwrLevel {
                 pwr: d.get_power_mode(ac),
             }),
@@ -777,4 +882,182 @@ fn apply_low_battery_lighting(battery_pct: f64, on_ac: bool) {
             );
         }
     }
+}
+
+fn read_cpu_package_temp_c() -> Option<f32> {
+    let hwmons = std::fs::read_dir("/sys/class/hwmon").ok()?;
+    let mut best_temp: Option<f32> = None;
+
+    for hwmon in hwmons.flatten() {
+        let path = hwmon.path();
+        for index in 1..=10 {
+            let label_path = path.join(format!("temp{}_label", index));
+            let input_path = path.join(format!("temp{}_input", index));
+            let label = std::fs::read_to_string(&label_path).ok();
+            let is_cpu_label = label.as_ref().is_some_and(|label| {
+                let label = label.trim();
+                label.eq_ignore_ascii_case("Package id 0")
+                    || label.eq_ignore_ascii_case("Tctl")
+                    || label.eq_ignore_ascii_case("Tdie")
+                    || label.to_ascii_lowercase().contains("package")
+            });
+            if !is_cpu_label || !input_path.exists() {
+                continue;
+            }
+            let temp_c = std::fs::read_to_string(&input_path)
+                .ok()
+                .and_then(|value| value.trim().parse::<f32>().ok())
+                .map(|millideg| millideg / 1000.0);
+            if let Some(temp_c) = temp_c {
+                best_temp = Some(best_temp.map_or(temp_c, |current| current.max(temp_c)));
+            }
+        }
+    }
+
+    if best_temp.is_some() {
+        return best_temp;
+    }
+
+    let zones = std::fs::read_dir("/sys/class/thermal").ok()?;
+    for zone in zones.flatten() {
+        let path = zone.path();
+        let type_path = path.join("type");
+        let temp_path = path.join("temp");
+        let zone_type = std::fs::read_to_string(type_path).ok()?;
+        if !zone_type.trim().eq_ignore_ascii_case("x86_pkg_temp") || !temp_path.exists() {
+            continue;
+        }
+        if let Ok(temp) = std::fs::read_to_string(temp_path) {
+            if let Ok(temp) = temp.trim().parse::<f32>() {
+                return Some(temp / 1000.0);
+            }
+        }
+    }
+
+    None
+}
+
+fn compute_temp_target_rpm(
+    controller: &mut TempFanController,
+    raw_temp: f32,
+    raw_util: f32,
+    target_temp: i32,
+    current_rpm: f32,
+    min_rpm: f32,
+    max_rpm: f32,
+) -> Option<i32> {
+    let now = std::time::Instant::now();
+    let mut dt = now.duration_since(controller.last_update).as_secs_f32();
+    if dt < 0.25 {
+        return None;
+    }
+
+    controller.last_update = now;
+    dt = dt.clamp(0.25, 1.5);
+
+    let raw_temp = raw_temp.clamp(0.0, 120.0);
+    let raw_util = raw_util.clamp(0.0, 100.0);
+    let min_rpm = min_rpm.min(max_rpm);
+    let max_rpm = max_rpm.max(min_rpm);
+
+    const TEMP_ALPHA: f32 = 0.35;
+    const UTIL_ALPHA: f32 = 0.18;
+    const KP: f32 = 170.0;
+    const KI: f32 = 10.0;
+    const KD: f32 = 40.0;
+    const STEP_UP: f32 = 1000.0;
+    const STEP_DOWN: f32 = 250.0;
+    const ENERGY_INPUT_GAIN: f32 = 0.02;
+    const ENERGY_DECAY: f32 = 0.92;
+    const TEMP_PREDICT_GAIN: f32 = 1.6;
+    const ENERGY_PREDICT_GAIN: f32 = 15.0;
+
+    if controller.smoothed_temp == 0.0 {
+        controller.smoothed_temp = raw_temp;
+        controller.smoothed_util = raw_util;
+        controller.prev_temp = raw_temp;
+    }
+
+    controller.smoothed_temp =
+        TEMP_ALPHA * raw_temp + (1.0 - TEMP_ALPHA) * controller.smoothed_temp;
+    controller.smoothed_util =
+        UTIL_ALPHA * raw_util + (1.0 - UTIL_ALPHA) * controller.smoothed_util;
+
+    let temp = controller.smoothed_temp;
+    let util = controller.smoothed_util;
+    controller.thermal_energy += util * ENERGY_INPUT_GAIN * dt;
+    controller.thermal_energy *= ENERGY_DECAY;
+
+    let velocity = (temp - controller.prev_temp) / dt;
+    let predicted_temp =
+        (temp + velocity * TEMP_PREDICT_GAIN + controller.thermal_energy * ENERGY_PREDICT_GAIN)
+            .clamp(temp - 5.0, temp + 10.0);
+
+    controller.prev_temp = temp;
+
+    let error = predicted_temp - target_temp as f32;
+
+    if raw_util < 5.0 && temp < target_temp as f32 - 8.0 {
+        let idle_rpm = quantize_rpm(min_rpm, min_rpm, max_rpm) as i32;
+        return if idle_rpm != current_rpm as i32 {
+            Some(idle_rpm)
+        } else {
+            None
+        };
+    }
+
+    if error.abs() < 0.8 && util < 35.0 {
+        return None;
+    }
+
+    if error.abs() < 8.0 {
+        controller.integral += error * dt;
+        controller.integral = controller.integral.clamp(-160.0, 160.0);
+    } else {
+        controller.integral *= 0.9;
+    }
+
+    let pid = KP * error + KI * controller.integral + KD * velocity;
+    let desired = (min_rpm + pid).clamp(min_rpm, max_rpm);
+    let next = if desired > current_rpm {
+        (current_rpm + STEP_UP * dt).min(desired)
+    } else {
+        (current_rpm - STEP_DOWN * dt).max(desired)
+    };
+
+    let next_rpm = quantize_rpm(next, min_rpm, max_rpm) as i32;
+    if next_rpm != current_rpm as i32 {
+        Some(next_rpm)
+    } else {
+        None
+    }
+}
+
+fn quantize_rpm(rpm: f32, min_rpm: f32, max_rpm: f32) -> f32 {
+    const FAN_STEPS: [f32; 9] = [
+        1500.0, 1800.0, 2100.0, 2500.0, 3000.0, 3500.0, 4000.0, 4500.0, 5000.0,
+    ];
+
+    let mut steps: Vec<f32> = FAN_STEPS
+        .iter()
+        .copied()
+        .filter(|step| *step >= min_rpm && *step <= max_rpm)
+        .collect();
+    if steps.is_empty() {
+        steps.push(min_rpm);
+        if (max_rpm - min_rpm).abs() > f32::EPSILON {
+            steps.push(max_rpm);
+        }
+    }
+
+    steps
+        .iter()
+        .min_by(|left, right| {
+            (rpm.clamp(min_rpm, max_rpm) - **left)
+                .abs()
+                .partial_cmp(&(rpm.clamp(min_rpm, max_rpm) - **right).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .copied()
+        .unwrap_or(rpm.clamp(min_rpm, max_rpm))
 }

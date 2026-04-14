@@ -11,6 +11,8 @@ pub struct PowerConfig {
     pub cpu_boost: u8,
     pub gpu_boost: u8,
     pub fan_rpm: i32,
+    #[serde(default)]
+    pub temp_target_c: i32,
     pub brightness: u8,
     pub logo_state: u8,
     pub screensaver: bool, // turno of keyboard light if screen is blank
@@ -30,6 +32,7 @@ impl PowerConfig {
             cpu_boost: 1,
             gpu_boost: 0,
             fan_rpm: 0,
+            temp_target_c: 0,
             brightness: 128,
             logo_state: 0,
             screensaver: false,

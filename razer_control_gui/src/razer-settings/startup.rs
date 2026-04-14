@@ -26,10 +26,23 @@ fn current_exec() -> String {
         .unwrap_or_else(|_| "razer-settings".into())
 }
 
-fn desktop_entry() -> String {
+fn desktop_quote(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+fn desktop_entry(start_minimized: bool) -> String {
+    let exec = if start_minimized {
+        format!(
+            "/usr/bin/env RAZER_SETTINGS_START_MINIMIZED=1 {}",
+            desktop_quote(&current_exec())
+        )
+    } else {
+        desktop_quote(&current_exec())
+    };
+
     format!(
-        "[Desktop Entry]\nType=Application\nName=Razer Blade Control (tray)\nComment=Start Razer Blade Control minimized to the system tray\nExec={} --minimized\nIcon=razer-blade-control\nTerminal=false\nX-GNOME-Autostart-enabled=true\nHidden=false\n",
-        current_exec(),
+        "[Desktop Entry]\nType=Application\nName=Razer Blade Control (tray)\nComment=Start Razer Blade Control from your desktop session\nExec={exec}\nIcon=razer-blade-control\nTerminal=false\nStartupNotify=false\nX-GNOME-Autostart-enabled=true\nHidden=false\n",
     )
 }
 
@@ -37,11 +50,11 @@ pub fn is_enabled() -> bool {
     autostart_path().exists()
 }
 
-pub fn set_enabled(enable: bool) -> io::Result<()> {
+pub fn set_enabled(enable: bool, start_minimized: bool) -> io::Result<()> {
     let path = autostart_path();
     if enable {
         fs::create_dir_all(autostart_dir())?;
-        fs::write(path, desktop_entry())?;
+        fs::write(path, desktop_entry(start_minimized))?;
     } else if path.exists() {
         fs::remove_file(path)?;
     }

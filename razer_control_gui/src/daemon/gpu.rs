@@ -1,9 +1,11 @@
 use lazy_static::lazy_static;
+use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 lazy_static! {
     /// Most recent GPU snapshot taken by the GPU load monitor.
@@ -15,6 +17,13 @@ lazy_static! {
     /// device on battery just to discover that it is already suspended.
     static ref NVIDIA_RUNTIME_STATUS_PATH: Option<PathBuf> = find_nvidia_runtime_status_path();
 }
+
+struct NvmlEnergyBaseline {
+    energy_mj: u64,
+    at: Instant,
+}
+
+static NVML_ENERGY: OnceLock<Mutex<Option<NvmlEnergyBaseline>>> = OnceLock::new();
 
 fn find_nvidia_runtime_status_path() -> Option<PathBuf> {
     let devices = fs::read_dir("/sys/bus/pci/devices").ok()?;
@@ -55,12 +64,9 @@ pub fn get_cached_gpu_status() -> Option<GpuStatus> {
 }
 
 /// Returns true when it is reasonable to query nvidia-smi.
-/// On battery, avoid touching the dGPU if the kernel already runtime-suspended it.
-pub fn should_query_nvidia(on_ac: bool) -> bool {
-    if on_ac {
-        return true;
-    }
-
+/// If the kernel has runtime-suspended the dGPU, avoid touching it in either
+/// AC or battery mode so telemetry polling does not wake it up.
+pub fn should_query_nvidia(_on_ac: bool) -> bool {
     match NVIDIA_RUNTIME_STATUS_PATH
         .as_ref()
         .and_then(|path| fs::read_to_string(path).ok())
@@ -87,6 +93,10 @@ pub struct GpuStatus {
 }
 
 pub fn query_nvidia_gpu() -> Option<GpuStatus> {
+    if let Some(status) = query_nvml() {
+        return Some(status);
+    }
+
     let output = Command::new("nvidia-smi")
         .args([
             // enforced.power.limit reflects the current firmware-set TGP (e.g. 135W in
@@ -122,5 +132,59 @@ pub fn query_nvidia_gpu() -> Option<GpuStatus> {
         mem_total_mb: parts[8].trim().parse().unwrap_or(0),
         clock_gpu_mhz: parts[9].trim().parse().unwrap_or(0),
         clock_mem_mhz: parts[10].trim().parse().unwrap_or(0),
+    })
+}
+
+fn query_nvml() -> Option<GpuStatus> {
+    let nvml = nvml_wrapper::Nvml::init().ok()?;
+    let device = nvml.device_by_index(0).ok()?;
+
+    let name = device.name().ok()?;
+    let temp_c = device.temperature(TemperatureSensor::Gpu).ok()? as i32;
+    let util = device.utilization_rates().ok()?;
+    let power_mw = device.power_usage().ok()?;
+    let limit_mw = device.power_management_limit().ok()?;
+    let max_limit_mw = device
+        .power_management_limit_constraints()
+        .ok()
+        .map(|limits| limits.max_limit)
+        .unwrap_or(limit_mw);
+    let mem = device.memory_info().ok()?;
+    let clock_gpu_mhz = device.clock_info(Clock::Graphics).ok()?;
+    let clock_mem_mhz = device.clock_info(Clock::Memory).ok()?;
+    let energy_total_mj = device.total_energy_consumption().ok();
+
+    let power_w = {
+        let state = NVML_ENERGY.get_or_init(|| Mutex::new(None));
+        let mut baseline = state.lock().ok()?;
+        let averaged = match (energy_total_mj, baseline.as_ref()) {
+            (Some(energy_mj), Some(previous)) => {
+                let delta_mj = energy_mj.saturating_sub(previous.energy_mj);
+                let delta_ms = previous.at.elapsed().as_millis().max(1) as f64;
+                Some((delta_mj as f64 / delta_ms) as f32)
+            }
+            _ => None,
+        };
+        if let Some(energy_mj) = energy_total_mj {
+            *baseline = Some(NvmlEnergyBaseline {
+                energy_mj,
+                at: Instant::now(),
+            });
+        }
+        averaged.unwrap_or(power_mw as f32 / 1000.0)
+    };
+
+    Some(GpuStatus {
+        name,
+        temp_c,
+        gpu_util: util.gpu as u8,
+        mem_util: util.memory as u8,
+        power_w,
+        power_limit_w: limit_mw as f32 / 1000.0,
+        power_max_limit_w: max_limit_mw as f32 / 1000.0,
+        mem_used_mb: (mem.used / 1_048_576) as u32,
+        mem_total_mb: (mem.total / 1_048_576) as u32,
+        clock_gpu_mhz,
+        clock_mem_mhz,
     })
 }

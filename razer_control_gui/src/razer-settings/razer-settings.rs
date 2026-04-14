@@ -27,8 +27,8 @@ use util::*;
 use widgets::ColorWheel;
 
 lazy_static! {
-    /// Set when the binary is started with --minimized / -m; causes the
-    /// main window to stay hidden until opened from the tray icon.
+    /// Set when autostart requests a tray-only launch; keeps the main
+    /// window hidden until opened from the tray icon.
     static ref START_MINIMIZED: AtomicBool = AtomicBool::new(false);
 }
 
@@ -213,6 +213,28 @@ fn set_fan_speed(ac: bool, value: i32) -> Option<bool> {
     }
 }
 
+fn get_fan_temperature_target(ac: bool) -> Option<i32> {
+    let ac = if ac { 1 } else { 0 };
+    match send_data(comms::DaemonCommand::GetFanTemperatureTarget { ac })? {
+        comms::DaemonResponse::GetFanTemperatureTarget { temp_c } => Some(temp_c),
+        r => {
+            eprintln!("Unexpected: {r:?}");
+            None
+        }
+    }
+}
+
+fn set_fan_temperature_target(ac: bool, temp_c: i32) -> Option<bool> {
+    let ac = if ac { 1 } else { 0 };
+    match send_data(comms::DaemonCommand::SetFanTemperatureTarget { ac, temp_c })? {
+        comms::DaemonResponse::SetFanTemperatureTarget { result } => Some(result),
+        r => {
+            eprintln!("Unexpected: {r:?}");
+            None
+        }
+    }
+}
+
 fn get_power_limits(ac: bool) -> Option<(u32, u32, u32)> {
     let ac = if ac { 1 } else { 0 };
     match send_data(comms::DaemonCommand::GetPowerLimits { ac })? {
@@ -370,10 +392,9 @@ impl SimpleComponent for App {
             glib::Propagation::Stop
         });
 
-        // Start hidden if --minimized was passed
+        // Keep the window hidden until the tray explicitly reopens it.
         if START_MINIMIZED.load(Ordering::Relaxed) {
-            let root_clone = root.clone();
-            glib::idle_add_local_once(move || root_clone.set_visible(false));
+            root.set_visible(false);
         }
 
         ComponentParts { model, widgets }
@@ -501,14 +522,27 @@ fn build_power_page(ac: bool, device: &SupportedDevice) -> gtk::ScrolledWindow {
     {
         let group = adw::PreferencesGroup::builder().title("Fan Speed").build();
         let fan_speed = get_fan_speed(ac).unwrap_or(0);
+        let fan_temp_target = get_fan_temperature_target(ac).unwrap_or(0);
         let min_fan = *device.fan.get(0).unwrap_or(&3500) as f64;
         let max_fan = *device.fan.get(1).unwrap_or(&5000) as f64;
+        let fan_mode = if fan_temp_target > 0 {
+            2
+        } else if fan_speed == 0 {
+            0
+        } else {
+            1
+        };
 
-        let auto_row = adw::SwitchRow::builder()
-            .title("Auto")
-            .subtitle("Let the firmware manage fan speed")
-            .active(fan_speed == 0)
+        let mode_row = adw::ComboRow::builder()
+            .title("Mode")
+            .subtitle("Choose firmware auto, fixed RPM, or daemon temperature control")
             .build();
+        mode_row.set_model(Some(&gtk::StringList::new(&[
+            "Auto",
+            "Manual RPM",
+            "Temperature Target",
+        ])));
+        mode_row.set_selected(fan_mode);
 
         let spin_row = adw::SpinRow::with_range(min_fan, max_fan, 100.0);
         spin_row.set_title("Speed (RPM)");
@@ -518,30 +552,78 @@ fn build_power_page(ac: bool, device: &SupportedDevice) -> gtk::ScrolledWindow {
         } else {
             fan_speed as f64
         });
-        spin_row.set_sensitive(fan_speed != 0);
+        spin_row.set_sensitive(fan_mode == 1);
+
+        let temp_row = adw::SpinRow::with_range(60.0, 95.0, 1.0);
+        temp_row.set_title("Target Temperature");
+        temp_row.set_subtitle("Daemon keeps CPU/GPU thermals near this target");
+        temp_row.set_value(if fan_temp_target > 0 {
+            fan_temp_target as f64
+        } else {
+            78.0
+        });
+        temp_row.set_sensitive(fan_mode == 2);
 
         let spin_clone = spin_row.clone();
-        auto_row.connect_active_notify(move |row| {
-            let rpm = if row.is_active() { 0 } else { min_fan as i32 };
-            set_fan_speed(ac, rpm);
-            let readback = get_fan_speed(ac).unwrap_or(0);
-            let is_auto = readback == 0;
-            row.set_active(is_auto);
-            spin_clone.set_sensitive(!is_auto);
-            if !is_auto {
-                spin_clone.set_value(readback as f64);
+        let temp_clone = temp_row.clone();
+        mode_row.connect_selected_notify(move |row| {
+            match row.selected() {
+                0 => {
+                    let _ = set_fan_temperature_target(ac, 0);
+                    let _ = set_fan_speed(ac, 0);
+                }
+                1 => {
+                    let _ = set_fan_temperature_target(ac, 0);
+                    let _ = set_fan_speed(ac, spin_clone.value().clamp(min_fan, max_fan) as i32);
+                }
+                2 => {
+                    let _ = set_fan_temperature_target(ac, temp_clone.value() as i32);
+                }
+                _ => {}
+            }
+
+            let readback_temp = get_fan_temperature_target(ac).unwrap_or(0);
+            let readback_rpm = get_fan_speed(ac).unwrap_or(0);
+            let mode = if readback_temp > 0 {
+                2
+            } else if readback_rpm == 0 {
+                0
+            } else {
+                1
+            };
+            row.set_selected(mode);
+            spin_clone.set_sensitive(mode == 1);
+            temp_clone.set_sensitive(mode == 2);
+            if readback_rpm > 0 {
+                spin_clone.set_value(readback_rpm as f64);
+            }
+            if readback_temp > 0 {
+                temp_clone.set_value(readback_temp as f64);
             }
         });
 
-        let auto_clone = auto_row.clone();
+        let mode_clone = mode_row.clone();
         spin_row.connect_value_notify(move |row| {
+            if mode_clone.selected() != 1 {
+                return;
+            }
             let val = row.value().clamp(min_fan, max_fan) as i32;
-            set_fan_speed(ac, val);
+            let _ = set_fan_speed(ac, val);
             let readback = get_fan_speed(ac).unwrap_or(0);
-            let is_auto = readback == 0;
-            auto_clone.set_active(is_auto);
-            row.set_sensitive(!is_auto);
-            if !is_auto {
+            if readback > 0 {
+                row.set_value(readback as f64);
+            }
+        });
+
+        let mode_clone = mode_row.clone();
+        temp_row.connect_value_notify(move |row| {
+            if mode_clone.selected() != 2 {
+                return;
+            }
+            let temp_c = row.value().clamp(60.0, 95.0) as i32;
+            let _ = set_fan_temperature_target(ac, temp_c);
+            let readback = get_fan_temperature_target(ac).unwrap_or(0);
+            if readback > 0 {
                 row.set_value(readback as f64);
             }
         });
@@ -577,8 +659,9 @@ fn build_power_page(ac: bool, device: &SupportedDevice) -> gtk::ScrolledWindow {
             ),
         );
 
-        group.add(&auto_row);
+        group.add(&mode_row);
         group.add(&spin_row);
+        group.add(&temp_row);
         group.add(&live_row);
         page.add(&group);
     }
@@ -1898,9 +1981,28 @@ for (var i = 0; i < wins.length; i++) {
             .active(autostart_enabled)
             .build();
 
+        let minimized_row = adw::SwitchRow::builder()
+            .title("Start Minimized to Tray")
+            .subtitle("Keep the main window hidden until the tray icon opens it")
+            .active(saved_gui.start_minimized)
+            .build();
+
+        minimized_row.connect_active_notify(move |row| {
+            let mut config = gui_config::GuiConfig::load();
+            config.start_minimized = row.is_active();
+            let _ = config.save();
+
+            if startup::is_enabled() {
+                if let Err(error) = startup::set_enabled(true, config.start_minimized) {
+                    eprintln!("Failed to refresh autostart entry: {error}");
+                }
+            }
+        });
+
+        let minimized_row_clone = minimized_row.clone();
         startup_row.connect_active_notify(move |row| {
             let requested = row.is_active();
-            if let Err(error) = startup::set_enabled(requested) {
+            if let Err(error) = startup::set_enabled(requested, minimized_row_clone.is_active()) {
                 eprintln!("Failed to update autostart entry: {error}");
             }
             let actual = startup::is_enabled();
@@ -1934,6 +2036,7 @@ for (var i = 0; i < wins.length; i++) {
         });
 
         integration_group.add(&startup_row);
+        integration_group.add(&minimized_row);
         integration_group.add(&state_row);
         page.add(&integration_group);
     }
@@ -1947,9 +2050,10 @@ for (var i = 0; i < wins.length; i++) {
 fn main() {
     setup_panic_hook();
 
-    // Parse CLI flags before GTK/relm4 consumes argv
-    // --minimized / -m : start with the window hidden; show from tray icon
-    let minimized = std::env::args().any(|a| a == "--minimized" || a == "-m");
+    // GTK rejects unknown CLI options, so minimized autostart is passed via env.
+    let minimized = std::env::var("RAZER_SETTINGS_START_MINIMIZED")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     if minimized {
         START_MINIMIZED.store(true, Ordering::Relaxed);
     }
