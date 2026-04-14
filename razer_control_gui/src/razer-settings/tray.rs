@@ -1,14 +1,24 @@
-use std::sync::mpsc;
-use std::process::Command;
 use ksni::menu::*;
+use std::sync::mpsc;
 
-fn cli(args: &[&str]) {
-    let _ = Command::new("razer-cli").args(args).spawn();
+#[derive(Debug, Clone)]
+pub enum TrayAction {
+    ShowWindow,
+    Restart,
+    Quit,
+    SetPowerMode { ac: bool, profile: u8 },
+    SetBrightness { ac: bool, percent: u8 },
+    SetEffect { name: String, params: Vec<u8> },
 }
 
 pub struct RazerTray {
-    pub show_window_sender: mpsc::Sender<()>,
-    pub restart_sender: mpsc::Sender<()>,
+    pub action_sender: mpsc::Sender<TrayAction>,
+}
+
+impl RazerTray {
+    fn send_action(&self, action: TrayAction) {
+        let _ = self.action_sender.send(action);
+    }
 }
 
 impl ksni::Tray for RazerTray {
@@ -34,7 +44,7 @@ impl ksni::Tray for RazerTray {
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
-        let _ = self.show_window_sender.send(());
+        self.send_action(TrayAction::ShowWindow);
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
@@ -43,7 +53,7 @@ impl ksni::Tray for RazerTray {
                 label: "Open Settings".into(),
                 icon_name: "preferences-desktop".into(),
                 activate: Box::new(|this: &mut Self| {
-                    let _ = this.show_window_sender.send(());
+                    this.send_action(TrayAction::ShowWindow);
                 }),
                 ..Default::default()
             }
@@ -55,44 +65,92 @@ impl ksni::Tray for RazerTray {
                 submenu: vec![
                     StandardItem {
                         label: "Static (Green)".into(),
-                        activate: Box::new(|_| cli(&["effect", "static", "0", "255", "0"])),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetEffect {
+                                name: "static".into(),
+                                params: vec![0, 255, 0],
+                            })
+                        }),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                     StandardItem {
                         label: "Static (White)".into(),
-                        activate: Box::new(|_| cli(&["effect", "static", "255", "255", "255"])),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetEffect {
+                                name: "static".into(),
+                                params: vec![255, 255, 255],
+                            })
+                        }),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                     StandardItem {
                         label: "Spectrum Cycle".into(),
-                        activate: Box::new(|_| cli(&["effect", "spectrum-cycle", "3"])),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetEffect {
+                                name: "spectrum_cycle".into(),
+                                params: vec![3],
+                            })
+                        }),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                     StandardItem {
                         label: "Rainbow Wave".into(),
-                        activate: Box::new(|_| cli(&["effect", "rainbow-wave", "3", "0"])),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetEffect {
+                                name: "rainbow_wave".into(),
+                                params: vec![3, 0],
+                            })
+                        }),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                     StandardItem {
                         label: "Wheel".into(),
-                        activate: Box::new(|_| cli(&["effect", "wheel", "3", "0"])),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetEffect {
+                                name: "wheel".into(),
+                                params: vec![3, 0],
+                            })
+                        }),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                     StandardItem {
                         label: "Breathing (Green)".into(),
-                        activate: Box::new(|_| cli(&["effect", "breathing-single", "0", "255", "0", "10"])),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetEffect {
+                                name: "breathing_single".into(),
+                                params: vec![0, 255, 0, 10],
+                            })
+                        }),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                     StandardItem {
                         label: "Ripple (Cyan)".into(),
-                        activate: Box::new(|_| cli(&["effect", "ripple", "0", "255", "255", "3"])),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetEffect {
+                                name: "ripple".into(),
+                                params: vec![0, 255, 255, 3],
+                            })
+                        }),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                     StandardItem {
                         label: "Starlight (White)".into(),
-                        activate: Box::new(|_| cli(&["effect", "starlight", "255", "255", "255", "10"])),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetEffect {
+                                name: "starlight".into(),
+                                params: vec![255, 255, 255, 10],
+                            })
+                        }),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                 ],
                 ..Default::default()
             }
@@ -103,24 +161,48 @@ impl ksni::Tray for RazerTray {
                 submenu: vec![
                     StandardItem {
                         label: "Balanced".into(),
-                        activate: Box::new(|_| cli(&["write", "power", "ac", "0"])),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetPowerMode {
+                                ac: true,
+                                profile: 0,
+                            })
+                        }),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                     StandardItem {
                         label: "Gaming".into(),
-                        activate: Box::new(|_| cli(&["write", "power", "ac", "1"])),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetPowerMode {
+                                ac: true,
+                                profile: 1,
+                            })
+                        }),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                     StandardItem {
                         label: "Creator".into(),
-                        activate: Box::new(|_| cli(&["write", "power", "ac", "2"])),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetPowerMode {
+                                ac: true,
+                                profile: 2,
+                            })
+                        }),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                     StandardItem {
                         label: "Silent".into(),
-                        activate: Box::new(|_| cli(&["write", "power", "ac", "3"])),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetPowerMode {
+                                ac: true,
+                                profile: 3,
+                            })
+                        }),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                 ],
                 ..Default::default()
             }
@@ -131,24 +213,174 @@ impl ksni::Tray for RazerTray {
                 submenu: vec![
                     StandardItem {
                         label: "Balanced".into(),
-                        activate: Box::new(|_| cli(&["write", "power", "bat", "0"])),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetPowerMode {
+                                ac: false,
+                                profile: 0,
+                            })
+                        }),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                     StandardItem {
                         label: "Gaming".into(),
-                        activate: Box::new(|_| cli(&["write", "power", "bat", "1"])),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetPowerMode {
+                                ac: false,
+                                profile: 1,
+                            })
+                        }),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                     StandardItem {
                         label: "Creator".into(),
-                        activate: Box::new(|_| cli(&["write", "power", "bat", "2"])),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetPowerMode {
+                                ac: false,
+                                profile: 2,
+                            })
+                        }),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
                     StandardItem {
                         label: "Silent".into(),
-                        activate: Box::new(|_| cli(&["write", "power", "bat", "3"])),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetPowerMode {
+                                ac: false,
+                                profile: 3,
+                            })
+                        }),
                         ..Default::default()
-                    }.into(),
+                    }
+                    .into(),
+                ],
+                ..Default::default()
+            }
+            .into(),
+            SubMenu {
+                label: "Brightness – AC".into(),
+                icon_name: "display-brightness-symbolic".into(),
+                submenu: vec![
+                    StandardItem {
+                        label: "Off".into(),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetBrightness {
+                                ac: true,
+                                percent: 0,
+                            })
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                    StandardItem {
+                        label: "25%".into(),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetBrightness {
+                                ac: true,
+                                percent: 25,
+                            })
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                    StandardItem {
+                        label: "50%".into(),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetBrightness {
+                                ac: true,
+                                percent: 50,
+                            })
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                    StandardItem {
+                        label: "75%".into(),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetBrightness {
+                                ac: true,
+                                percent: 75,
+                            })
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                    StandardItem {
+                        label: "100%".into(),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetBrightness {
+                                ac: true,
+                                percent: 100,
+                            })
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                ],
+                ..Default::default()
+            }
+            .into(),
+            SubMenu {
+                label: "Brightness – Battery".into(),
+                icon_name: "display-brightness-symbolic".into(),
+                submenu: vec![
+                    StandardItem {
+                        label: "Off".into(),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetBrightness {
+                                ac: false,
+                                percent: 0,
+                            })
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                    StandardItem {
+                        label: "25%".into(),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetBrightness {
+                                ac: false,
+                                percent: 25,
+                            })
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                    StandardItem {
+                        label: "50%".into(),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetBrightness {
+                                ac: false,
+                                percent: 50,
+                            })
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                    StandardItem {
+                        label: "75%".into(),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetBrightness {
+                                ac: false,
+                                percent: 75,
+                            })
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                    StandardItem {
+                        label: "100%".into(),
+                        activate: Box::new(|this: &mut Self| {
+                            this.send_action(TrayAction::SetBrightness {
+                                ac: false,
+                                percent: 100,
+                            })
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
                 ],
                 ..Default::default()
             }
@@ -158,7 +390,7 @@ impl ksni::Tray for RazerTray {
                 label: "Restart App".into(),
                 icon_name: "view-refresh-symbolic".into(),
                 activate: Box::new(|this: &mut Self| {
-                    let _ = this.restart_sender.send(());
+                    this.send_action(TrayAction::Restart);
                 }),
                 ..Default::default()
             }
@@ -166,7 +398,7 @@ impl ksni::Tray for RazerTray {
             StandardItem {
                 label: "Quit".into(),
                 icon_name: "application-exit".into(),
-                activate: Box::new(|_| std::process::exit(0)),
+                activate: Box::new(|this: &mut Self| this.send_action(TrayAction::Quit)),
                 ..Default::default()
             }
             .into(),

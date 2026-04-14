@@ -73,9 +73,7 @@ impl Effect for StaticGradient {
         Self: Sized,
     {
         let mut kbd = board::KeyboardData::new();
-        let args: [u8; 6] = [
-            args[0], args[1], args[2], args[3], args[4], args[5]
-        ];
+        let args: [u8; 6] = [args[0], args[1], args[2], args[3], args[4], args[5]];
         let mut c1 = board::AnimatorKeyColour::new_u(args[0], args[1], args[2]);
         let c2 = board::AnimatorKeyColour::new_u(args[3], args[4], args[5]);
         let delta = (c2 - c1).divide(14.0);
@@ -135,9 +133,7 @@ impl Effect for WaveGradient {
     where
         Self: Sized,
     {
-        let args: [u8; 6] = [
-            args[0], args[1], args[2], args[3], args[4], args[5],
-        ];
+        let args: [u8; 6] = [args[0], args[1], args[2], args[3], args[4], args[5]];
         let mut wave = WaveGradient {
             kbd: board::KeyboardData::new(),
             args,
@@ -332,7 +328,9 @@ impl Effect for BreathDual {
         let steps = cycle_duration_ms / ANIMATION_SLEEP_MS as f32;
         k.set_kbd_colour(0, 0, 0);
         Box::new(BreathDual {
-            args: [args[0], args[1], args[2], args[3], args[4], args[5], args[6]],
+            args: [
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6],
+            ],
             kbd: k,
             step_duration_ms: cycle_duration_ms as u128,
             static_start_ms: get_millis(),
@@ -355,8 +353,16 @@ impl Effect for BreathDual {
     }
 
     fn update(&mut self) -> board::KeyboardData {
-        let step_colour = if self.using_colour1 { self.step_colour1 } else { self.step_colour2 };
-        let target = if self.using_colour1 { self.colour1 } else { self.colour2 };
+        let step_colour = if self.using_colour1 {
+            self.step_colour1
+        } else {
+            self.step_colour2
+        };
+        let target = if self.using_colour1 {
+            self.colour1
+        } else {
+            self.colour2
+        };
         match self.curr_step {
             0 => {
                 self.current_colour = board::AnimatorKeyColour::new_u(0, 0, 0);
@@ -393,13 +399,27 @@ impl Effect for BreathDual {
         self.kbd
     }
 
-    fn get_name() -> &'static str where Self: Sized { "Breathing Dual" }
-    fn get_varargs(&mut self) -> &[u8] { &self.args }
-    fn clone_box(&self) -> Box<dyn Effect> { Box::new(*self) }
-    fn save(&mut self) -> EffectSave {
-        EffectSave { args: self.args.to_vec(), name: String::from("Breathing Dual") }
+    fn get_name() -> &'static str
+    where
+        Self: Sized,
+    {
+        "Breathing Dual"
     }
-    fn get_state(&mut self) -> Vec<u8> { self.kbd.get_curr_state() }
+    fn get_varargs(&mut self) -> &[u8] {
+        &self.args
+    }
+    fn clone_box(&self) -> Box<dyn Effect> {
+        Box::new(*self)
+    }
+    fn save(&mut self) -> EffectSave {
+        EffectSave {
+            args: self.args.to_vec(),
+            name: String::from("Breathing Dual"),
+        }
+    }
+    fn get_state(&mut self) -> Vec<u8> {
+        self.kbd.get_curr_state()
+    }
 }
 
 ///
@@ -415,8 +435,15 @@ pub struct SpectrumCycle {
 }
 
 impl Effect for SpectrumCycle {
-    fn new(args: Vec<u8>) -> Box<dyn Effect> where Self: Sized {
-        let speed = if args.is_empty() { 3 } else { args[0].max(1).min(10) };
+    fn new(args: Vec<u8>) -> Box<dyn Effect>
+    where
+        Self: Sized,
+    {
+        let speed = if args.is_empty() {
+            3
+        } else {
+            args[0].max(1).min(10)
+        };
         Box::new(SpectrumCycle {
             kbd: board::KeyboardData::new(),
             args: [speed],
@@ -432,18 +459,37 @@ impl Effect for SpectrumCycle {
         self.kbd
     }
 
-    fn get_name() -> &'static str where Self: Sized { "Spectrum Cycle" }
-    fn get_varargs(&mut self) -> &[u8] { &self.args }
-    fn clone_box(&self) -> Box<dyn Effect> { Box::new(self.clone()) }
-    fn save(&mut self) -> EffectSave {
-        EffectSave { args: self.args.to_vec(), name: String::from("Spectrum Cycle") }
+    fn get_name() -> &'static str
+    where
+        Self: Sized,
+    {
+        "Spectrum Cycle"
     }
-    fn get_state(&mut self) -> Vec<u8> { self.kbd.get_curr_state() }
+    fn get_varargs(&mut self) -> &[u8] {
+        &self.args
+    }
+    fn clone_box(&self) -> Box<dyn Effect> {
+        Box::new(self.clone())
+    }
+    fn save(&mut self) -> EffectSave {
+        EffectSave {
+            args: self.args.to_vec(),
+            name: String::from("Spectrum Cycle"),
+        }
+    }
+    fn get_state(&mut self) -> Vec<u8> {
+        self.kbd.get_curr_state()
+    }
 }
 
 impl Clone for SpectrumCycle {
     fn clone(&self) -> Self {
-        SpectrumCycle { kbd: self.kbd, args: self.args, hue: self.hue, speed: self.speed }
+        SpectrumCycle {
+            kbd: self.kbd,
+            args: self.args,
+            hue: self.hue,
+            speed: self.speed,
+        }
     }
 }
 
@@ -461,8 +507,15 @@ pub struct RainbowWave {
 }
 
 impl Effect for RainbowWave {
-    fn new(args: Vec<u8>) -> Box<dyn Effect> where Self: Sized {
-        let speed = if args.is_empty() { 3 } else { args[0].max(1).min(10) };
+    fn new(args: Vec<u8>) -> Box<dyn Effect>
+    where
+        Self: Sized,
+    {
+        let speed = if args.is_empty() {
+            3
+        } else {
+            args[0].max(1).min(10)
+        };
         let dir = if args.len() < 2 { 1 } else { args[1] };
         Box::new(RainbowWave {
             kbd: board::KeyboardData::new(),
@@ -475,7 +528,9 @@ impl Effect for RainbowWave {
 
     fn update(&mut self) -> board::KeyboardData {
         self.offset = (self.offset + self.speed * self.direction) % 360.0;
-        if self.offset < 0.0 { self.offset += 360.0; }
+        if self.offset < 0.0 {
+            self.offset += 360.0;
+        }
         for col in 0..15 {
             let hue = (self.offset + col as f32 * 24.0) % 360.0; // 360/15 = 24 deg per column
             let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
@@ -484,20 +539,37 @@ impl Effect for RainbowWave {
         self.kbd
     }
 
-    fn get_name() -> &'static str where Self: Sized { "Rainbow Wave" }
-    fn get_varargs(&mut self) -> &[u8] { &self.args }
-    fn clone_box(&self) -> Box<dyn Effect> { Box::new(self.clone()) }
-    fn save(&mut self) -> EffectSave {
-        EffectSave { args: self.args.to_vec(), name: String::from("Rainbow Wave") }
+    fn get_name() -> &'static str
+    where
+        Self: Sized,
+    {
+        "Rainbow Wave"
     }
-    fn get_state(&mut self) -> Vec<u8> { self.kbd.get_curr_state() }
+    fn get_varargs(&mut self) -> &[u8] {
+        &self.args
+    }
+    fn clone_box(&self) -> Box<dyn Effect> {
+        Box::new(self.clone())
+    }
+    fn save(&mut self) -> EffectSave {
+        EffectSave {
+            args: self.args.to_vec(),
+            name: String::from("Rainbow Wave"),
+        }
+    }
+    fn get_state(&mut self) -> Vec<u8> {
+        self.kbd.get_curr_state()
+    }
 }
 
 impl Clone for RainbowWave {
     fn clone(&self) -> Self {
         RainbowWave {
-            kbd: self.kbd, args: self.args,
-            offset: self.offset, speed: self.speed, direction: self.direction,
+            kbd: self.kbd,
+            args: self.args,
+            offset: self.offset,
+            speed: self.speed,
+            direction: self.direction,
         }
     }
 }
@@ -518,17 +590,26 @@ pub struct Starlight {
 }
 
 impl Effect for Starlight {
-    fn new(args: Vec<u8>) -> Box<dyn Effect> where Self: Sized {
+    fn new(args: Vec<u8>) -> Box<dyn Effect>
+    where
+        Self: Sized,
+    {
         let r = if args.is_empty() { 255 } else { args[0] };
         let g = if args.len() < 2 { 255 } else { args[1] };
         let b = if args.len() < 3 { 255 } else { args[2] };
-        let density = if args.len() < 4 { 5 } else { args[3].max(1).min(20) };
+        let density = if args.len() < 4 {
+            5
+        } else {
+            args[3].max(1).min(20)
+        };
         Box::new(Starlight {
             kbd: board::KeyboardData::new(),
             args: [r, g, b, density],
             stars: Vec::new(),
             density: density as usize,
-            r, g, b,
+            r,
+            g,
+            b,
         })
     }
 
@@ -562,21 +643,39 @@ impl Effect for Starlight {
         self.kbd
     }
 
-    fn get_name() -> &'static str where Self: Sized { "Starlight" }
-    fn get_varargs(&mut self) -> &[u8] { &self.args }
-    fn clone_box(&self) -> Box<dyn Effect> { Box::new(self.clone()) }
-    fn save(&mut self) -> EffectSave {
-        EffectSave { args: self.args.to_vec(), name: String::from("Starlight") }
+    fn get_name() -> &'static str
+    where
+        Self: Sized,
+    {
+        "Starlight"
     }
-    fn get_state(&mut self) -> Vec<u8> { self.kbd.get_curr_state() }
+    fn get_varargs(&mut self) -> &[u8] {
+        &self.args
+    }
+    fn clone_box(&self) -> Box<dyn Effect> {
+        Box::new(self.clone())
+    }
+    fn save(&mut self) -> EffectSave {
+        EffectSave {
+            args: self.args.to_vec(),
+            name: String::from("Starlight"),
+        }
+    }
+    fn get_state(&mut self) -> Vec<u8> {
+        self.kbd.get_curr_state()
+    }
 }
 
 impl Clone for Starlight {
     fn clone(&self) -> Self {
         Starlight {
-            kbd: self.kbd, args: self.args,
-            stars: self.stars.clone(), density: self.density,
-            r: self.r, g: self.g, b: self.b,
+            kbd: self.kbd,
+            args: self.args,
+            stars: self.stars.clone(),
+            density: self.density,
+            r: self.r,
+            g: self.g,
+            b: self.b,
         }
     }
 }
@@ -598,18 +697,27 @@ pub struct Ripple {
 }
 
 impl Effect for Ripple {
-    fn new(args: Vec<u8>) -> Box<dyn Effect> where Self: Sized {
+    fn new(args: Vec<u8>) -> Box<dyn Effect>
+    where
+        Self: Sized,
+    {
         let r = if args.is_empty() { 0 } else { args[0] };
         let g = if args.len() < 2 { 255 } else { args[1] };
         let b = if args.len() < 3 { 255 } else { args[2] };
-        let speed = if args.len() < 4 { 3 } else { args[3].max(1).min(10) };
+        let speed = if args.len() < 4 {
+            3
+        } else {
+            args[3].max(1).min(10)
+        };
         Box::new(Ripple {
             kbd: board::KeyboardData::new(),
             args: [r, g, b, speed],
             radius: 0.0,
             speed: speed as f32 * 0.3,
             max_radius: 10.0,
-            r, g, b,
+            r,
+            g,
+            b,
         })
     }
 
@@ -627,7 +735,11 @@ impl Effect for Ripple {
                 let dc = (col as f32 - center_col) * 0.6; // Scale cols to roughly match rows
                 let dist = (dr * dr + dc * dc).sqrt();
                 let ring_dist = (dist - self.radius).abs();
-                let brightness = if ring_dist < 1.0 { 1.0 - ring_dist } else { 0.0 };
+                let brightness = if ring_dist < 1.0 {
+                    1.0 - ring_dist
+                } else {
+                    0.0
+                };
                 let r = (self.r as f32 * brightness) as u8;
                 let g = (self.g as f32 * brightness) as u8;
                 let b = (self.b as f32 * brightness) as u8;
@@ -637,21 +749,40 @@ impl Effect for Ripple {
         self.kbd
     }
 
-    fn get_name() -> &'static str where Self: Sized { "Ripple" }
-    fn get_varargs(&mut self) -> &[u8] { &self.args }
-    fn clone_box(&self) -> Box<dyn Effect> { Box::new(self.clone()) }
-    fn save(&mut self) -> EffectSave {
-        EffectSave { args: self.args.to_vec(), name: String::from("Ripple") }
+    fn get_name() -> &'static str
+    where
+        Self: Sized,
+    {
+        "Ripple"
     }
-    fn get_state(&mut self) -> Vec<u8> { self.kbd.get_curr_state() }
+    fn get_varargs(&mut self) -> &[u8] {
+        &self.args
+    }
+    fn clone_box(&self) -> Box<dyn Effect> {
+        Box::new(self.clone())
+    }
+    fn save(&mut self) -> EffectSave {
+        EffectSave {
+            args: self.args.to_vec(),
+            name: String::from("Ripple"),
+        }
+    }
+    fn get_state(&mut self) -> Vec<u8> {
+        self.kbd.get_curr_state()
+    }
 }
 
 impl Clone for Ripple {
     fn clone(&self) -> Self {
         Ripple {
-            kbd: self.kbd, args: self.args,
-            radius: self.radius, speed: self.speed,
-            max_radius: self.max_radius, r: self.r, g: self.g, b: self.b,
+            kbd: self.kbd,
+            args: self.args,
+            radius: self.radius,
+            speed: self.speed,
+            max_radius: self.max_radius,
+            r: self.r,
+            g: self.g,
+            b: self.b,
         }
     }
 }
@@ -669,7 +800,11 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
         240..=299 => (x, 0.0, c),
         _ => (c, 0.0, x),
     };
-    (((r + m) * 255.0) as u8, ((g + m) * 255.0) as u8, ((b + m) * 255.0) as u8)
+    (
+        ((r + m) * 255.0) as u8,
+        ((g + m) * 255.0) as u8,
+        ((b + m) * 255.0) as u8,
+    )
 }
 
 ///
@@ -688,8 +823,15 @@ pub struct Wheel {
 }
 
 impl Effect for Wheel {
-    fn new(args: Vec<u8>) -> Box<dyn Effect> where Self: Sized {
-        let speed = if args.is_empty() { 3 } else { args[0].max(1).min(10) };
+    fn new(args: Vec<u8>) -> Box<dyn Effect>
+    where
+        Self: Sized,
+    {
+        let speed = if args.is_empty() {
+            3
+        } else {
+            args[0].max(1).min(10)
+        };
         let dir = if args.len() < 2 { 0 } else { args[1] };
         Box::new(Wheel {
             kbd: board::KeyboardData::new(),
@@ -702,7 +844,9 @@ impl Effect for Wheel {
 
     fn update(&mut self) -> board::KeyboardData {
         self.offset = (self.offset + self.speed * self.direction) % 360.0;
-        if self.offset < 0.0 { self.offset += 360.0; }
+        if self.offset < 0.0 {
+            self.offset += 360.0;
+        }
 
         let center_row = 4.0_f32; // N key row
         let center_col = 6.0_f32; // N key column
@@ -725,11 +869,25 @@ impl Effect for Wheel {
         self.kbd
     }
 
-    fn get_name() -> &'static str where Self: Sized { "Wheel" }
-    fn get_varargs(&mut self) -> &[u8] { &self.args }
-    fn clone_box(&self) -> Box<dyn Effect> { Box::new(self.clone()) }
-    fn save(&mut self) -> EffectSave {
-        EffectSave { args: self.args.to_vec(), name: String::from("Wheel") }
+    fn get_name() -> &'static str
+    where
+        Self: Sized,
+    {
+        "Wheel"
     }
-    fn get_state(&mut self) -> Vec<u8> { self.kbd.get_curr_state() }
+    fn get_varargs(&mut self) -> &[u8] {
+        &self.args
+    }
+    fn clone_box(&self) -> Box<dyn Effect> {
+        Box::new(self.clone())
+    }
+    fn save(&mut self) -> EffectSave {
+        EffectSave {
+            args: self.args.to_vec(),
+            name: String::from("Wheel"),
+        }
+    }
+    fn get_state(&mut self) -> Vec<u8> {
+        self.kbd.get_curr_state()
+    }
 }

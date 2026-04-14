@@ -1,9 +1,9 @@
+use lazy_static::lazy_static;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
-use serde::{Deserialize, Serialize};
-use lazy_static::lazy_static;
 
 lazy_static! {
     /// Most recent GPU snapshot taken by the GPU load monitor.
@@ -61,7 +61,8 @@ pub fn should_query_nvidia(on_ac: bool) -> bool {
         return true;
     }
 
-    match NVIDIA_RUNTIME_STATUS_PATH.as_ref()
+    match NVIDIA_RUNTIME_STATUS_PATH
+        .as_ref()
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|status| status.trim().to_string())
     {

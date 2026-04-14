@@ -8,56 +8,148 @@ pub const SOCKET_PATH: &str = "/tmp/razercontrol-socket";
 #[derive(Serialize, Deserialize, Debug)]
 /// Represents data sent TO the daemon
 pub enum DaemonCommand {
-    SetFanSpeed { ac: usize, rpm: i32 },      // Fan speed
-    GetFanSpeed { ac: usize },                 // Get (Fan speed)
-    SetPowerMode { ac: usize, pwr: u8, cpu: u8, gpu: u8}, // Power mode
-    GetPwrLevel { ac: usize },                 // Get (Power mode)
-    GetCPUBoost { ac: usize },                 // Get (CPU boost)
-    GetGPUBoost { ac: usize },                 // Get (GPU boost)
-    SetLogoLedState{ ac:usize, logo_state: u8 },
-    GetLogoLedState { ac: usize },
-    GetKeyboardRGB { layer: i32 }, // Layer ID
-    SetEffect { name: String, params: Vec<u8> }, // Set keyboard colour
-    SetStandardEffect { name: String, params: Vec<u8> }, // Set keyboard colour
-    SetBrightness { ac:usize, val: u8 },
-    SetIdle {ac: usize, val: u32 },
-    GetBrightness { ac: usize },
-    SetSync { sync: bool },
-    GetSync (),
-    SetBatteryHealthOptimizer { is_on: bool, threshold: u8 },
-    GetBatteryHealthOptimizer (),
+    SetFanSpeed {
+        ac: usize,
+        rpm: i32,
+    }, // Fan speed
+    GetFanSpeed {
+        ac: usize,
+    }, // Get (Fan speed)
+    SetPowerMode {
+        ac: usize,
+        pwr: u8,
+        cpu: u8,
+        gpu: u8,
+    }, // Power mode
+    GetPwrLevel {
+        ac: usize,
+    }, // Get (Power mode)
+    GetCPUBoost {
+        ac: usize,
+    }, // Get (CPU boost)
+    GetGPUBoost {
+        ac: usize,
+    }, // Get (GPU boost)
+    SetLogoLedState {
+        ac: usize,
+        logo_state: u8,
+    },
+    GetLogoLedState {
+        ac: usize,
+    },
+    GetKeyboardRGB {
+        layer: i32,
+    }, // Layer ID
+    SetEffect {
+        name: String,
+        params: Vec<u8>,
+    }, // Set keyboard colour
+    SetStandardEffect {
+        name: String,
+        params: Vec<u8>,
+    }, // Set keyboard colour
+    SetBrightness {
+        ac: usize,
+        val: u8,
+    },
+    SetIdle {
+        ac: usize,
+        val: u32,
+    },
+    GetBrightness {
+        ac: usize,
+    },
+    SetSync {
+        sync: bool,
+    },
+    GetSync(),
+    SetBatteryHealthOptimizer {
+        is_on: bool,
+        threshold: u8,
+    },
+    GetBatteryHealthOptimizer(),
     GetDeviceName,
     GetGpuStatus,
-    GetPowerLimits { ac: usize },
-    SetPowerLimits { ac: usize, pl1_watts: u32, pl2_watts: u32 },
+    GetPowerLimits {
+        ac: usize,
+    },
+    SetPowerLimits {
+        ac: usize,
+        pl1_watts: u32,
+        pl2_watts: u32,
+    },
     GetCurrentEffect,
     /// Live fan RPM from the EC tachometer (model-agnostic).
     GetFanTachometer,
+    SetLowBatteryLighting {
+        threshold_pct: f64,
+    },
+    GetLowBatteryLighting,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 /// Represents data sent back from Daemon after it receives
 /// a command.
 pub enum DaemonResponse {
-    SetFanSpeed { result: bool },                    // Response
-    GetFanSpeed { rpm: i32 },                        // Get (Fan speed)
-    SetPowerMode { result: bool },                   // Response
-    GetPwrLevel { pwr: u8 },                         // Get (Power mode)
-    GetCPUBoost { cpu: u8 },                         // Get (CPU boost)
-    GetGPUBoost { gpu: u8 },                         // Get (GPU boost)
-    SetLogoLedState {result: bool },
-    GetLogoLedState { logo_state: u8 },
-    GetKeyboardRGB { layer: i32, rgbdata: Vec<u8> }, // Response (RGB) of 90 keys
-    SetEffect { result: bool },                       // Set keyboard colour
-    SetStandardEffect { result: bool },                       // Set keyboard colour
-    SetBrightness { result: bool },
-    SetIdle { result: bool },
-    GetBrightness { result: u8 },
-    SetSync { result: bool },
-    GetSync { sync: bool },
-    SetBatteryHealthOptimizer { result: bool },
-    GetBatteryHealthOptimizer { is_on: bool, threshold: u8 },
-    GetDeviceName { name: String },
+    SetFanSpeed {
+        result: bool,
+    }, // Response
+    GetFanSpeed {
+        rpm: i32,
+    }, // Get (Fan speed)
+    SetPowerMode {
+        result: bool,
+    }, // Response
+    GetPwrLevel {
+        pwr: u8,
+    }, // Get (Power mode)
+    GetCPUBoost {
+        cpu: u8,
+    }, // Get (CPU boost)
+    GetGPUBoost {
+        gpu: u8,
+    }, // Get (GPU boost)
+    SetLogoLedState {
+        result: bool,
+    },
+    GetLogoLedState {
+        logo_state: u8,
+    },
+    GetKeyboardRGB {
+        layer: i32,
+        rgbdata: Vec<u8>,
+    }, // Response (RGB) of 90 keys
+    SetEffect {
+        result: bool,
+    }, // Set keyboard colour
+    SetStandardEffect {
+        result: bool,
+    }, // Set keyboard colour
+    SetBrightness {
+        result: bool,
+    },
+    SetIdle {
+        result: bool,
+    },
+    GetBrightness {
+        result: u8,
+    },
+    SetSync {
+        result: bool,
+    },
+    GetSync {
+        sync: bool,
+    },
+    SetBatteryHealthOptimizer {
+        result: bool,
+    },
+    GetBatteryHealthOptimizer {
+        is_on: bool,
+        threshold: u8,
+    },
+    GetDeviceName {
+        name: String,
+    },
     GetGpuStatus {
         name: String,
         temp_c: i32,
@@ -77,13 +169,26 @@ pub enum DaemonResponse {
         pl2_watts: u32,
         pl1_max_watts: u32,
     },
-    SetPowerLimits { result: bool },
+    SetPowerLimits {
+        result: bool,
+    },
     /// Name is the internal effect name (e.g. "Static", "Rainbow Wave"); args are
     /// the raw parameter bytes as passed to the effect constructor.
     /// Returns None-equivalent (name="", args=[]) if no effect is loaded.
-    GetCurrentEffect { name: String, args: Vec<u8> },
+    GetCurrentEffect {
+        name: String,
+        args: Vec<u8>,
+    },
     /// Live fan RPM from the EC tachometer.
-    GetFanTachometer { rpm: i32 },
+    GetFanTachometer {
+        rpm: i32,
+    },
+    SetLowBatteryLighting {
+        result: bool,
+    },
+    GetLowBatteryLighting {
+        threshold_pct: f64,
+    },
 }
 
 /// Returns `true` when the daemon socket is connectable (used by CLI for liveness check).

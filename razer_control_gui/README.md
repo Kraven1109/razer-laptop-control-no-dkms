@@ -23,6 +23,9 @@ Linux daemon and GUI for controlling Razer Blade laptops via HID (no kernel driv
 - **PRIME anti-flicker GPU guard** — Avoids extra `nvidia-smi` calls during PRIME-heavy gaming/ComfyUI bursts and marks held samples as cached in the GUI, CLI, and CSV log
 - **Smart animation throttle** — Keyboard RGB automatically slows to 3 FPS under heavy GPU load (≥70%), reducing EC interrupt contention with NVIDIA Dynamic Boost
 - **System tray quick actions** — Power modes, lighting effects, open settings
+- **Direct tray controls** — Power profiles, brightness presets, and lighting effects without spawning extra CLI processes
+- **Low-battery lighting saver** — Automatically blank keyboard/logo lighting below a configurable threshold
+- **Desktop integration controls** — GUI-managed autostart plus persisted last-opened page
 - **Settings persistence** — All settings saved to disk and restored on daemon restart
 - **Cross-DE support** — KDE Plasma + Wayland, GNOME (with AppIndicator extension for tray)
 - **Custom Razer-themed icon** — Dark blade/diamond with green gradient
@@ -116,7 +119,7 @@ Launch from application menu or:
 razer-settings
 ```
 
-Pages: AC settings (+ CPU power limits), Battery settings, Keyboard (backlight effects + BHO), About (device info + live GPU stats with TGP limit + performance timeline with watt Y-axis).
+Pages: AC settings (+ CPU power limits + live fan tachometer), Battery settings, Keyboard (backlight effects + BHO + low-battery lighting saver), About (device info + live GPU stats with TGP limit + performance timeline with watt Y-axis + desktop integration).
 
 The keyboard backlight section shows dynamic controls based on the selected effect:
 per-effect speed, direction, density, and duration sliders, plus primary/secondary color pickers.
@@ -126,6 +129,8 @@ per-effect speed, direction, density, and duration sliders, plus primary/seconda
 The tray icon appears automatically when `razer-settings` is running.
 Provides quick access to power modes, fan speed, brightness, keyboard effects,
 standard effects, and app controls.
+
+Autostart is now managed from the GUI under `System -> Desktop Integration`.
 
 - **KDE Plasma:** Works natively (StatusNotifierItem)
 - **GNOME:** Install the AppIndicator/KStatusNotifierItem extension

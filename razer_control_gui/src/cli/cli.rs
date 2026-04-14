@@ -3,7 +3,11 @@ mod comms;
 use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(version="0.5.0", about="razer laptop configuration for linux", name="razer-cli")]
+#[command(
+    version = "0.5.0",
+    about = "razer laptop configuration for linux",
+    name = "razer-cli"
+)]
 struct Cli {
     #[command(subcommand)]
     args: Args,
@@ -435,10 +439,9 @@ fn main() {
                     params.duration,
                 ],
             ),
-            Effect::SpectrumCycle(params) => send_effect(
-                "spectrum_cycle".to_string(),
-                vec![params.speed],
-            ),
+            Effect::SpectrumCycle(params) => {
+                send_effect("spectrum_cycle".to_string(), vec![params.speed])
+            }
             Effect::RainbowWave(params) => send_effect(
                 "rainbow_wave".to_string(),
                 vec![params.speed, params.direction],
@@ -451,10 +454,9 @@ fn main() {
                 "ripple".to_string(),
                 vec![params.red, params.green, params.blue, params.speed],
             ),
-            Effect::Wheel(params) => send_effect(
-                "wheel".to_string(),
-                vec![params.speed, params.direction],
-            ),
+            Effect::Wheel(params) => {
+                send_effect("wheel".to_string(), vec![params.speed, params.direction])
+            }
         },
         Args::StandardEffect { effect } => match effect {
             StandardEffect::Off => send_standard_effect("off".to_string(), vec![]),
@@ -631,7 +633,7 @@ fn send_standard_effect(name: String, params: Vec<u8>) {
             } else {
                 eprintln!("Effect set FAIL!");
             }
-        },
+        }
         Some(_) => eprintln!("Unexpected response from daemon!"),
         None => eprintln!("Unknown daemon error!"),
     }
@@ -645,7 +647,7 @@ fn send_effect(name: String, params: Vec<u8>) {
             } else {
                 eprintln!("Effect set FAIL!");
             }
-        },
+        }
         Some(_) => eprintln!("Unexpected response from daemon!"),
         None => eprintln!("Unknown daemon error!"),
     }
@@ -657,7 +659,7 @@ fn send_data(opt: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
         None => {
             eprintln!("Error. Cannot bind to socket");
             None
-        },
+        }
     }
 }
 
@@ -670,7 +672,7 @@ fn read_fan_rpm(ac: usize) {
                 _ => format!("{} RPM", rpm),
             };
             println!("Current fan setting: {}", rpm_desc);
-        },
+        }
         Some(_) => eprintln!("Daemon responded with invalid data!"),
         None => eprintln!("Unknown daemon error!"),
     }
@@ -686,7 +688,7 @@ fn read_logo_mode(ac: usize) {
                 _ => "Unknown",
             };
             println!("Current logo setting: {}", logo_state_desc);
-        },
+        }
         Some(_) => eprintln!("Daemon responded with invalid data!"),
         None => eprintln!("Unknown daemon error!"),
     }
@@ -738,7 +740,10 @@ fn read_power_mode(ac: usize) {
 fn write_pwr_mode(ac: usize, pwr_mode: u8, cpu_mode: Option<u8>, gpu_mode: Option<u8>) {
     if pwr_mode > 4 {
         Cli::command()
-            .error(ErrorKind::InvalidValue, "Power mode must be 0, 1, 2, 3 or 4")
+            .error(
+                ErrorKind::InvalidValue,
+                "Power mode must be 0, 1, 2, 3 or 4",
+            )
             .exit()
     }
 
@@ -773,14 +778,12 @@ fn write_pwr_mode(ac: usize, pwr_mode: u8, cpu_mode: Option<u8>, gpu_mode: Optio
         gpu: gm,
     }) {
         Some(_) => read_power_mode(ac),
-        None => {
-            Cli::command()
-                .error(
-                    ErrorKind::DisplayHelp,
-                    "An error occurred while sending the command to the daemon",
-                )
-                .exit()
-        },
+        None => Cli::command()
+            .error(
+                ErrorKind::DisplayHelp,
+                "An error occurred while sending the command to the daemon",
+            )
+            .exit(),
     }
 }
 
@@ -788,7 +791,7 @@ fn read_brightness(ac: usize) {
     match send_data(comms::DaemonCommand::GetBrightness { ac }) {
         Some(comms::DaemonResponse::GetBrightness { result }) => {
             println!("Current brightness: {}", result);
-        },
+        }
         Some(_) => eprintln!("Daemon responded with invalid data!"),
         None => eprintln!("Unknown daemon error!"),
     }
@@ -798,7 +801,7 @@ fn read_sync() {
     match send_data(comms::DaemonCommand::GetSync()) {
         Some(comms::DaemonResponse::GetSync { sync }) => {
             println!("Current sync: {:?}", sync);
-        },
+        }
         Some(_) => eprintln!("Daemon responded with invalid data!"),
         None => eprintln!("Unknown daemon error!"),
     }
@@ -835,17 +838,37 @@ fn write_sync(sync: bool) {
 fn read_gpu_status() {
     match send_data(comms::DaemonCommand::GetGpuStatus) {
         Some(comms::DaemonResponse::GetGpuStatus {
-            name, temp_c, gpu_util, mem_util, stale, power_w, power_limit_w, power_max_limit_w,
-            mem_used_mb, mem_total_mb, clock_gpu_mhz, clock_mem_mhz
+            name,
+            temp_c,
+            gpu_util,
+            mem_util,
+            stale,
+            power_w,
+            power_limit_w,
+            power_max_limit_w,
+            mem_used_mb,
+            mem_total_mb,
+            clock_gpu_mhz,
+            clock_mem_mhz,
         }) => {
-            println!("GPU:         {}{}", name, if stale { " (cached)" } else { "" });
+            println!(
+                "GPU:         {}{}",
+                name,
+                if stale { " (cached)" } else { "" }
+            );
             println!("Temperature: {}°C", temp_c);
             println!("GPU Usage:   {}%", gpu_util);
-            println!("VRAM Usage:  {}% ({} / {} MiB)", mem_util, mem_used_mb, mem_total_mb);
-            println!("Power Draw:  {:.1} W  (TGP enforced: {:.0} W / max: {:.0} W)", power_w, power_limit_w, power_max_limit_w);
+            println!(
+                "VRAM Usage:  {}% ({} / {} MiB)",
+                mem_util, mem_used_mb, mem_total_mb
+            );
+            println!(
+                "Power Draw:  {:.1} W  (TGP enforced: {:.0} W / max: {:.0} W)",
+                power_w, power_limit_w, power_max_limit_w
+            );
             println!("GPU Clock:   {} MHz", clock_gpu_mhz);
             println!("Mem Clock:   {} MHz", clock_mem_mhz);
-        },
+        }
         Some(_) => eprintln!("Daemon responded with invalid data!"),
         None => eprintln!("GPU monitoring unavailable (nvidia-smi not found or failed)"),
     }
@@ -853,13 +876,19 @@ fn read_gpu_status() {
 
 fn read_power_limits() {
     let ac = std::fs::read_to_string("/sys/class/power_supply/AC0/online")
-        .ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(1);
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(1);
     match send_data(comms::DaemonCommand::GetPowerLimits { ac }) {
-        Some(comms::DaemonResponse::GetPowerLimits { pl1_watts, pl2_watts, pl1_max_watts }) => {
+        Some(comms::DaemonResponse::GetPowerLimits {
+            pl1_watts,
+            pl2_watts,
+            pl1_max_watts,
+        }) => {
             println!("PL1 (sustained):  {} W", pl1_watts);
             println!("PL2 (boost):      {} W", pl2_watts);
             println!("Base TDP:         {} W", pl1_max_watts);
-        },
+        }
         Some(_) => eprintln!("Daemon responded with invalid data!"),
         None => eprintln!("Power limits unavailable (intel_rapl not found)"),
     }
@@ -867,14 +896,20 @@ fn read_power_limits() {
 
 fn write_power_limits(pl1: u32, pl2: u32) {
     let ac = std::fs::read_to_string("/sys/class/power_supply/AC0/online")
-        .ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(1);
-    match send_data(comms::DaemonCommand::SetPowerLimits { ac, pl1_watts: pl1, pl2_watts: pl2 }) {
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(1);
+    match send_data(comms::DaemonCommand::SetPowerLimits {
+        ac,
+        pl1_watts: pl1,
+        pl2_watts: pl2,
+    }) {
         Some(comms::DaemonResponse::SetPowerLimits { result: true }) => {
             println!("Power limits set: PL1={} W, PL2={} W", pl1, pl2);
-        },
+        }
         Some(comms::DaemonResponse::SetPowerLimits { result: false }) => {
             eprintln!("Failed to set power limits (permission denied?)");
-        },
+        }
         Some(_) => eprintln!("Daemon responded with invalid data!"),
         None => eprintln!("Failed to communicate with daemon"),
     }

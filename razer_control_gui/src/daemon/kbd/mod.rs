@@ -154,8 +154,11 @@ impl EffectManager {
         self.layers.pop();
         // If no more layers, erase keyboard rendering and set it to black
         if self.layers.is_empty() {
-            self.render_board.set_kbd_colour(0, 0, 0); 
-            if self.render_board.update_kbd(laptop, &mut self.last_sent_rows) {
+            self.render_board.set_kbd_colour(0, 0, 0);
+            if self
+                .render_board
+                .update_kbd(laptop, &mut self.last_sent_rows)
+            {
                 self.render_board.update_custom_mode(laptop);
             }
         }
@@ -176,7 +179,10 @@ impl EffectManager {
         }
         // Don't forget to actually render the board
         self.last_update_ms = get_millis();
-        if self.render_board.update_kbd(laptop, &mut self.last_sent_rows) {
+        if self
+            .render_board
+            .update_kbd(laptop, &mut self.last_sent_rows)
+        {
             self.render_board.update_custom_mode(laptop);
         }
     }

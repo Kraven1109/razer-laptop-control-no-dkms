@@ -1,25 +1,28 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::{atomic::{AtomicBool, Ordering}, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
 use std::thread::{self, JoinHandle};
 use std::time;
 
-use log::*;
-use lazy_static::lazy_static;
-use signal_hook::iterator::Signals;
-use signal_hook::consts::{SIGINT, SIGTERM};
 use dbus::blocking::Connection;
-use dbus::{Message, arg};
+use dbus::{arg, Message};
+use lazy_static::lazy_static;
+use log::*;
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 
+mod battery;
 #[path = "../comms.rs"]
 mod comms;
 mod config;
-mod kbd;
 mod device;
-mod battery;
-mod screensaver;
-mod login1;
 mod gpu;
+mod kbd;
+mod login1;
+mod screensaver;
 
 use crate::kbd::Effect;
 
@@ -34,6 +37,8 @@ lazy_static! {
     /// Set to true while the system is suspended so GPU polling and HID
     /// writes are suppressed until the device is re-opened after resume.
     static ref SYSTEM_SLEEPING: AtomicBool = AtomicBool::new(false);
+    static ref LOW_BAT_LIGHTS_FORCED_OFF: AtomicBool = AtomicBool::new(false);
+    static ref LAST_BATTERY_PERCENT: Mutex<f64> = Mutex::new(100.0);
 }
 
 // Main function for daemon
@@ -54,11 +59,13 @@ fn main() {
         std::process::exit(1);
     }
 
-
     if let Ok(mut d) = DEV_MANAGER.lock() {
-        let dbus_system = Connection::new_system()
-            .expect("failed to connect to D-Bus system bus");
-        let proxy_ac = dbus_system.with_proxy("org.freedesktop.UPower", "/org/freedesktop/UPower/devices/line_power_AC0", time::Duration::from_millis(5000));
+        let dbus_system = Connection::new_system().expect("failed to connect to D-Bus system bus");
+        let proxy_ac = dbus_system.with_proxy(
+            "org.freedesktop.UPower",
+            "/org/freedesktop/UPower/devices/line_power_AC0",
+            time::Duration::from_millis(5000),
+        );
         use battery::OrgFreedesktopUPowerDevice;
         if let Ok(online) = proxy_ac.online() {
             info!("AC0 online: {:?}", online);
@@ -78,10 +85,21 @@ fn main() {
             } else {
                 println!("No effects save, creating a new one");
                 // No effects found, start with a green static layer, just like synapse
-                EFFECT_MANAGER.lock().unwrap().push_effect(
-                    kbd::effects::Static::new(vec![0, 255, 0]), 
-                    [true; 90]
-                    );
+                EFFECT_MANAGER
+                    .lock()
+                    .unwrap()
+                    .push_effect(kbd::effects::Static::new(vec![0, 255, 0]), [true; 90]);
+            }
+
+            use battery::OrgFreedesktopUPowerDevice;
+            let proxy_battery = dbus_system.with_proxy(
+                "org.freedesktop.UPower",
+                "/org/freedesktop/UPower/devices/battery_BAT0",
+                time::Duration::from_millis(5000),
+            );
+            if let Ok(percentage) = proxy_battery.percentage() {
+                store_last_battery_percent(percentage);
+                apply_low_battery_lighting(percentage, online);
             }
         } else {
             println!("error getting current power state");
@@ -150,7 +168,8 @@ pub fn start_keyboard_animator_task() -> JoinHandle<()> {
 }
 
 fn gpu_monitor_on_ac() -> bool {
-    DEV_MANAGER.lock()
+    DEV_MANAGER
+        .lock()
         .ok()
         .and_then(|mut d| d.get_device().map(|laptop| laptop.get_ac_state() == 1))
         .unwrap_or(true)
@@ -187,24 +206,36 @@ pub fn start_gpu_load_monitor_task() -> JoinHandle<()> {
 
 fn start_screensaver_monitor_task() -> JoinHandle<()> {
     thread::spawn(move || {
-        let dbus_session = Connection::new_session()
-            .expect("failed to connect to D-Bus session bus");
+        let dbus_session =
+            Connection::new_session().expect("failed to connect to D-Bus session bus");
         // Uses org.freedesktop.ScreenSaver which is supported by both KDE Plasma and GNOME
-        let proxy = dbus_session.with_proxy("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", time::Duration::from_millis(5000));
-        let _id = proxy.match_signal(|h: screensaver::OrgFreedesktopScreenSaverActiveChanged, _: &Connection, _: &Message| {
-            // Ignore screensaver events while the system is suspended — the HID
-            // device is closed and restore_light() would fail silently.
-            if SYSTEM_SLEEPING.load(Ordering::Relaxed) {
-                return true;
-            }
-            match DEV_MANAGER.lock() {
-                Ok(mut d) => {
-                    if h.arg0 { d.light_off(); } else { d.restore_light(); }
+        let proxy = dbus_session.with_proxy(
+            "org.freedesktop.ScreenSaver",
+            "/org/freedesktop/ScreenSaver",
+            time::Duration::from_millis(5000),
+        );
+        let _id = proxy.match_signal(
+            |h: screensaver::OrgFreedesktopScreenSaverActiveChanged,
+             _: &Connection,
+             _: &Message| {
+                // Ignore screensaver events while the system is suspended — the HID
+                // device is closed and restore_light() would fail silently.
+                if SYSTEM_SLEEPING.load(Ordering::Relaxed) {
+                    return true;
                 }
-                Err(e) => error!("DEV_MANAGER lock failed in screensaver handler: {}", e),
-            }
-            true
-        });
+                match DEV_MANAGER.lock() {
+                    Ok(mut d) => {
+                        if h.arg0 {
+                            d.light_off();
+                        } else {
+                            d.restore_light();
+                        }
+                    }
+                    Err(e) => error!("DEV_MANAGER lock failed in screensaver handler: {}", e),
+                }
+                true
+            },
+        );
 
         loop {
             dbus_session.process(time::Duration::from_millis(1000)).ok();
@@ -214,53 +245,69 @@ fn start_screensaver_monitor_task() -> JoinHandle<()> {
 
 fn start_battery_monitor_task() -> JoinHandle<()> {
     thread::spawn(move || {
-        let dbus_system = Connection::new_system()
-            .expect("should be able to connect to D-Bus system bus");
+        let dbus_system =
+            Connection::new_system().expect("should be able to connect to D-Bus system bus");
         info!("Connected to the system D-Bus");
 
         let proxy_ac = dbus_system.with_proxy(
             "org.freedesktop.UPower",
             "/org/freedesktop/UPower/devices/line_power_AC0",
-            time::Duration::from_millis(5000)
+            time::Duration::from_millis(5000),
         );
 
         let proxy_battery = dbus_system.with_proxy(
             "org.freedesktop.UPower",
             "/org/freedesktop/UPower/devices/battery_BAT0",
-            time::Duration::from_millis(5000)
+            time::Duration::from_millis(5000),
         );
 
         let proxy_login = dbus_system.with_proxy(
             "org.freedesktop.login1",
             "/org/freedesktop/login1",
-            time::Duration::from_millis(5000)
+            time::Duration::from_millis(5000),
         );
 
-        let _id = proxy_ac.match_signal(|h: battery::OrgFreedesktopDBusPropertiesPropertiesChanged, _: &Connection, _: &Message| {
-            let online: Option<&bool> = arg::prop_cast(&h.changed_properties, "Online");
-            if let Some(online) = online {
-                info!("AC0 online: {:?}", online);
-                if let Ok(mut d) = DEV_MANAGER.lock() {
-                    d.set_ac_state(*online);
-                    // Apply the RAPL profile saved for the new AC state.
-                    let ac = if *online { 1usize } else { 0usize };
-                    if let Some(cfg) = d.get_ac_config(ac) {
-                        apply_rapl_for_profile(cfg.rapl_pl1_watts, cfg.rapl_pl2_watts);
+        let _id = proxy_ac.match_signal(
+            |h: battery::OrgFreedesktopDBusPropertiesPropertiesChanged,
+             _: &Connection,
+             _: &Message| {
+                let online: Option<&bool> = arg::prop_cast(&h.changed_properties, "Online");
+                if let Some(online) = online {
+                    info!("AC0 online: {:?}", online);
+                    if let Ok(mut d) = DEV_MANAGER.lock() {
+                        d.set_ac_state(*online);
+                        // Apply the RAPL profile saved for the new AC state.
+                        let ac = if *online { 1usize } else { 0usize };
+                        if let Some(cfg) = d.get_ac_config(ac) {
+                            apply_rapl_for_profile(cfg.rapl_pl1_watts, cfg.rapl_pl2_watts);
+                        }
                     }
+                    // Always clear GPU cache on AC state transition.
+                    gpu::clear_gpu_cache();
+                    apply_low_battery_lighting(read_last_battery_percent(), *online);
                 }
-                // Always clear GPU cache on AC state transition.
-                gpu::clear_gpu_cache();
-            }
-            true
-        });
+                true
+            },
+        );
 
-        let _id = proxy_battery.match_signal(|h: battery::OrgFreedesktopDBusPropertiesPropertiesChanged, _: &Connection, _: &Message| {
-            let perc: Option<&f64> = arg::prop_cast(&h.changed_properties, "Percentage");
-            if let Some(perc) = perc {
-                info!("Battery percentage: {:.1}", perc);
-            }
-            true
-        });
+        let _id = proxy_battery.match_signal(
+            |h: battery::OrgFreedesktopDBusPropertiesPropertiesChanged,
+             _: &Connection,
+             _: &Message| {
+                let perc: Option<&f64> = arg::prop_cast(&h.changed_properties, "Percentage");
+                if let Some(perc) = perc {
+                    info!("Battery percentage: {:.1}", perc);
+                    store_last_battery_percent(*perc);
+                    let on_ac = DEV_MANAGER
+                        .lock()
+                        .ok()
+                        .and_then(|mut d| d.get_device().map(|laptop| laptop.get_ac_state() == 1))
+                        .unwrap_or(false);
+                    apply_low_battery_lighting(*perc, on_ac);
+                }
+                true
+            },
+        );
 
         let _id = proxy_login.match_signal(|h: login1::OrgFreedesktopLogin1ManagerPrepareForSleep, _: &Connection, _: &Message| {
             info!("PrepareForSleep start={}", h.start);
@@ -325,7 +372,7 @@ pub fn start_shutdown_task() -> JoinHandle<()> {
     thread::spawn(|| {
         let mut signals = Signals::new([SIGINT, SIGTERM]).unwrap();
         let _ = signals.forever().next();
-        
+
         // If we reach this point, we have a signal and it is time to exit
         println!("Received signal, cleaning up");
         let json = EFFECT_MANAGER.lock().unwrap().save();
@@ -367,7 +414,10 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                 // the readback will differ from what we sent.
                 let confirmed = d.get_power_mode(ac);
                 if confirmed == pwr {
-                    info!("Power mode set OK (pwr={} cpu={} gpu={} ac={})", pwr, cpu, gpu, ac);
+                    info!(
+                        "Power mode set OK (pwr={} cpu={} gpu={} ac={})",
+                        pwr, cpu, gpu, ac
+                    );
                 } else {
                     warn!("Power mode mismatch: sent {} but EC reports {} (HID write may have failed)", pwr, confirmed);
                 }
@@ -378,26 +428,38 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                 // window and confuse the user into thinking TGP did not change.
                 gpu::clear_gpu_cache();
                 Some(comms::DaemonResponse::SetPowerMode { result: ok })
-            },
+            }
             comms::DaemonCommand::SetFanSpeed { ac, rpm } => {
-                Some(comms::DaemonResponse::SetFanSpeed { result: d.set_fan_rpm(ac, rpm) })
-            },
-            comms::DaemonCommand::SetLogoLedState{ ac, logo_state } => {
-                Some(comms::DaemonResponse::SetLogoLedState { result: d.set_logo_led_state(ac, logo_state) })
-            },
+                Some(comms::DaemonResponse::SetFanSpeed {
+                    result: d.set_fan_rpm(ac, rpm),
+                })
+            }
+            comms::DaemonCommand::SetLogoLedState { ac, logo_state } => {
+                Some(comms::DaemonResponse::SetLogoLedState {
+                    result: d.set_logo_led_state(ac, logo_state),
+                })
+            }
             comms::DaemonCommand::SetBrightness { ac, val } => {
-                Some(comms::DaemonResponse::SetBrightness {result: d.set_brightness(ac, val) })
+                Some(comms::DaemonResponse::SetBrightness {
+                    result: d.set_brightness(ac, val),
+                })
             }
-            comms::DaemonCommand::SetIdle { ac, val } => {
-                Some(comms::DaemonResponse::SetIdle { result: d.change_idle(ac, val) })
+            comms::DaemonCommand::SetIdle { ac, val } => Some(comms::DaemonResponse::SetIdle {
+                result: d.change_idle(ac, val),
+            }),
+            comms::DaemonCommand::SetSync { sync } => Some(comms::DaemonResponse::SetSync {
+                result: d.set_sync(sync),
+            }),
+            comms::DaemonCommand::GetBrightness { ac } => {
+                Some(comms::DaemonResponse::GetBrightness {
+                    result: d.get_brightness(ac),
+                })
             }
-            comms::DaemonCommand::SetSync { sync } => {
-                Some(comms::DaemonResponse::SetSync { result: d.set_sync(sync) })
+            comms::DaemonCommand::GetLogoLedState { ac } => {
+                Some(comms::DaemonResponse::GetLogoLedState {
+                    logo_state: d.get_logo_led_state(ac),
+                })
             }
-            comms::DaemonCommand::GetBrightness{ac} =>  {
-                Some(comms::DaemonResponse::GetBrightness { result: d.get_brightness(ac)})
-            },
-            comms::DaemonCommand::GetLogoLedState{ac} => Some(comms::DaemonResponse::GetLogoLedState {logo_state: d.get_logo_led_state(ac) }),
             comms::DaemonCommand::GetKeyboardRGB { layer } => {
                 let map = EFFECT_MANAGER.lock().unwrap().get_map(layer);
                 Some(comms::DaemonResponse::GetKeyboardRGB {
@@ -405,12 +467,22 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                     rgbdata: map,
                 })
             }
-            comms::DaemonCommand::GetSync() => Some(comms::DaemonResponse::GetSync { sync: d.get_sync() }),
-            comms::DaemonCommand::GetFanSpeed{ac} => Some(comms::DaemonResponse::GetFanSpeed { rpm: d.get_fan_rpm(ac)}),
-            comms::DaemonCommand::GetPwrLevel{ac} => Some(comms::DaemonResponse::GetPwrLevel { pwr: d.get_power_mode(ac) }),
-            comms::DaemonCommand::GetCPUBoost{ac} => Some(comms::DaemonResponse::GetCPUBoost { cpu: d.get_cpu_boost(ac) }),
-            comms::DaemonCommand::GetGPUBoost{ac} => Some(comms::DaemonResponse::GetGPUBoost { gpu: d.get_gpu_boost(ac) }),
-            comms::DaemonCommand::SetEffect{ name, params } => {
+            comms::DaemonCommand::GetSync() => {
+                Some(comms::DaemonResponse::GetSync { sync: d.get_sync() })
+            }
+            comms::DaemonCommand::GetFanSpeed { ac } => Some(comms::DaemonResponse::GetFanSpeed {
+                rpm: d.get_fan_rpm(ac),
+            }),
+            comms::DaemonCommand::GetPwrLevel { ac } => Some(comms::DaemonResponse::GetPwrLevel {
+                pwr: d.get_power_mode(ac),
+            }),
+            comms::DaemonCommand::GetCPUBoost { ac } => Some(comms::DaemonResponse::GetCPUBoost {
+                cpu: d.get_cpu_boost(ac),
+            }),
+            comms::DaemonCommand::GetGPUBoost { ac } => Some(comms::DaemonResponse::GetGPUBoost {
+                gpu: d.get_gpu_boost(ac),
+            }),
+            comms::DaemonCommand::SetEffect { name, params } => {
                 let mut res = false;
                 if let Ok(mut k) = EFFECT_MANAGER.lock() {
                     let effect = match name.as_str() {
@@ -424,7 +496,7 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                         "starlight" => Some(kbd::effects::Starlight::new(params)),
                         "ripple" => Some(kbd::effects::Ripple::new(params)),
                         "wheel" => Some(kbd::effects::Wheel::new(params)),
-                        _ => None
+                        _ => None,
                     };
 
                     if let Some(laptop) = d.get_device() {
@@ -444,10 +516,10 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                         }
                     }
                 }
-                Some(comms::DaemonResponse::SetEffect{result: res})
+                Some(comms::DaemonResponse::SetEffect { result: res })
             }
 
-            comms::DaemonCommand::SetStandardEffect{ name, params } => {
+            comms::DaemonCommand::SetStandardEffect { name, params } => {
                 // TODO save standart effect may be struct ?
                 let mut res = false;
                 if let Some(laptop) = d.get_device() {
@@ -456,11 +528,19 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                         let _res = match name.as_str() {
                             "off" => d.set_standard_effect(device::RazerLaptop::OFF, params),
                             "wave" => d.set_standard_effect(device::RazerLaptop::WAVE, params),
-                            "reactive" => d.set_standard_effect(device::RazerLaptop::REACTIVE, params),
-                            "breathing" => d.set_standard_effect(device::RazerLaptop::BREATHING, params),
-                            "spectrum" => d.set_standard_effect(device::RazerLaptop::SPECTRUM, params),
+                            "reactive" => {
+                                d.set_standard_effect(device::RazerLaptop::REACTIVE, params)
+                            }
+                            "breathing" => {
+                                d.set_standard_effect(device::RazerLaptop::BREATHING, params)
+                            }
+                            "spectrum" => {
+                                d.set_standard_effect(device::RazerLaptop::SPECTRUM, params)
+                            }
                             "static" => d.set_standard_effect(device::RazerLaptop::STATIC, params),
-                            "starlight" => d.set_standard_effect(device::RazerLaptop::STARLIGHT, params), 
+                            "starlight" => {
+                                d.set_standard_effect(device::RazerLaptop::STARLIGHT, params)
+                            }
                             _ => false,
                         };
                         res = _res;
@@ -468,23 +548,25 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                 } else {
                     res = false;
                 }
-                Some(comms::DaemonResponse::SetStandardEffect{result: res})
+                Some(comms::DaemonResponse::SetStandardEffect { result: res })
             }
-            comms::DaemonCommand::SetBatteryHealthOptimizer { is_on, threshold } => { 
-                return Some(comms::DaemonResponse::SetBatteryHealthOptimizer { result: d.set_bho_handler(is_on, threshold)});
+            comms::DaemonCommand::SetBatteryHealthOptimizer { is_on, threshold } => {
+                return Some(comms::DaemonResponse::SetBatteryHealthOptimizer {
+                    result: d.set_bho_handler(is_on, threshold),
+                });
             }
             comms::DaemonCommand::GetBatteryHealthOptimizer() => {
-                return d.get_bho_handler().map(|result| 
+                return d.get_bho_handler().map(|result| {
                     comms::DaemonResponse::GetBatteryHealthOptimizer {
-                        is_on: (result.0), 
-                        threshold: (result.1) 
+                        is_on: (result.0),
+                        threshold: (result.1),
                     }
-                );
+                });
             }
             comms::DaemonCommand::GetDeviceName => {
                 let name = match &d.device {
                     Some(device) => device.get_name().to_string(),
-                    None => "Unknown Device".to_string()
+                    None => "Unknown Device".to_string(),
                 };
                 return Some(comms::DaemonResponse::GetDeviceName { name });
             }
@@ -493,24 +575,29 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                 // Use the cache populated by the GPU load monitor to avoid
                 // spawning a second nvidia-smi per GUI poll cycle.
                 // Fall back to a direct query only if the cache is cold.
-                let on_ac = d.get_device()
+                let on_ac = d
+                    .get_device()
                     .map(|laptop| laptop.get_ac_state() == 1)
                     .unwrap_or(true);
                 let status = if let Some(status) = gpu::get_cached_gpu_status() {
                     status
-                } else if SYSTEM_SLEEPING.load(Ordering::Relaxed) || !gpu::should_query_nvidia(on_ac) {
+                } else if SYSTEM_SLEEPING.load(Ordering::Relaxed)
+                    || !gpu::should_query_nvidia(on_ac)
+                {
                     gpu::GpuStatus {
                         name: "NVIDIA GPU (runtime suspended)".into(),
                         ..gpu::GpuStatus::default()
                     }
                 } else {
-                    gpu::query_nvidia_gpu().map(|s| {
-                        gpu::store_gpu_cache(&s);
-                        s
-                    }).unwrap_or_else(|| gpu::GpuStatus {
-                        name: "NVIDIA GPU (runtime suspended)".into(),
-                        ..gpu::GpuStatus::default()
-                    })
+                    gpu::query_nvidia_gpu()
+                        .map(|s| {
+                            gpu::store_gpu_cache(&s);
+                            s
+                        })
+                        .unwrap_or_else(|| gpu::GpuStatus {
+                            name: "NVIDIA GPU (runtime suspended)".into(),
+                            ..gpu::GpuStatus::default()
+                        })
                 };
                 return Some(comms::DaemonResponse::GetGpuStatus {
                     name: status.name,
@@ -529,16 +616,22 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
             }
 
             comms::DaemonCommand::GetPowerLimits { ac } => {
-                let pl1_max = read_rapl_uw("/sys/class/powercap/intel-rapl:0/constraint_0_max_power_uw");
+                let pl1_max =
+                    read_rapl_uw("/sys/class/powercap/intel-rapl:0/constraint_0_max_power_uw");
                 // Return the saved config values for the requested AC profile if set,
                 // otherwise fall back to the current sysfs (live) values.
                 let (pl1_cfg, pl2_cfg) = d.get_rapl_limits(ac);
                 let (pl1, pl2) = if pl1_cfg > 0 {
-                    (pl1_cfg as u64 * 1_000_000,
-                     pl2_cfg as u64 * 1_000_000)
+                    (pl1_cfg as u64 * 1_000_000, pl2_cfg as u64 * 1_000_000)
                 } else {
-                    (read_rapl_uw("/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw"),
-                     read_rapl_uw("/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw"))
+                    (
+                        read_rapl_uw(
+                            "/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw",
+                        ),
+                        read_rapl_uw(
+                            "/sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw",
+                        ),
+                    )
                 };
                 return Some(comms::DaemonResponse::GetPowerLimits {
                     pl1_watts: (pl1 / 1_000_000) as u32,
@@ -547,13 +640,15 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                 });
             }
 
-            comms::DaemonCommand::SetPowerLimits { ac, pl1_watts, pl2_watts } => {
+            comms::DaemonCommand::SetPowerLimits {
+                ac,
+                pl1_watts,
+                pl2_watts,
+            } => {
                 // Persist to config for the given AC profile.
                 let saved = d.set_rapl_limits(ac, pl1_watts, pl2_watts);
                 // Apply immediately only if we're currently on the matching AC state.
-                let current_ac = d.get_device()
-                    .map(|l| l.get_ac_state())
-                    .unwrap_or(1);
+                let current_ac = d.get_device().map(|l| l.get_ac_state()).unwrap_or(1);
                 let applied = if current_ac == ac {
                     let ok1 = write_rapl_uw(
                         "/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw",
@@ -567,20 +662,42 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                 } else {
                     true // saved to config; will apply on next AC state switch
                 };
-                return Some(comms::DaemonResponse::SetPowerLimits { result: saved && applied });
+                return Some(comms::DaemonResponse::SetPowerLimits {
+                    result: saved && applied,
+                });
             }
 
             comms::DaemonCommand::GetCurrentEffect => {
-                let info = EFFECT_MANAGER.lock().ok()
+                let info = EFFECT_MANAGER
+                    .lock()
+                    .ok()
                     .and_then(|mut em| em.get_current_effect_info());
                 let (name, args) = info.unwrap_or_else(|| (String::new(), Vec::new()));
                 return Some(comms::DaemonResponse::GetCurrentEffect { name, args });
             }
 
             comms::DaemonCommand::GetFanTachometer => {
-                Some(comms::DaemonResponse::GetFanTachometer { rpm: d.get_fan_tachometer() })
+                Some(comms::DaemonResponse::GetFanTachometer {
+                    rpm: d.get_fan_tachometer(),
+                })
             }
 
+            comms::DaemonCommand::SetLowBatteryLighting { threshold_pct } => {
+                let result = d.set_low_battery_lighting_threshold(threshold_pct);
+                let on_ac = d
+                    .get_device()
+                    .map(|laptop| laptop.get_ac_state() == 1)
+                    .unwrap_or(false);
+                drop(d);
+                apply_low_battery_lighting(read_last_battery_percent(), on_ac);
+                Some(comms::DaemonResponse::SetLowBatteryLighting { result })
+            }
+
+            comms::DaemonCommand::GetLowBatteryLighting => {
+                Some(comms::DaemonResponse::GetLowBatteryLighting {
+                    threshold_pct: d.get_low_battery_lighting_threshold(),
+                })
+            }
         };
     } else {
         return None;
@@ -614,5 +731,50 @@ fn apply_rapl_for_profile(pl1_watts: u32, pl2_watts: u32) {
             pl2_watts as u64 * 1_000_000,
         );
         info!("Applied RAPL PL2 = {} W", pl2_watts);
+    }
+}
+
+fn store_last_battery_percent(percentage: f64) {
+    if let Ok(mut last) = LAST_BATTERY_PERCENT.lock() {
+        *last = percentage.clamp(0.0, 100.0);
+    }
+}
+
+fn read_last_battery_percent() -> f64 {
+    LAST_BATTERY_PERCENT
+        .lock()
+        .map(|last| *last)
+        .unwrap_or(100.0)
+}
+
+fn apply_low_battery_lighting(battery_pct: f64, on_ac: bool) {
+    if SYSTEM_SLEEPING.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let threshold_pct = DEV_MANAGER
+        .lock()
+        .ok()
+        .map(|mut manager| manager.get_low_battery_lighting_threshold())
+        .unwrap_or(0.0);
+    let should_dim = !on_ac && threshold_pct > 0.0 && battery_pct <= threshold_pct;
+    let was_dimmed = LOW_BAT_LIGHTS_FORCED_OFF.swap(should_dim, Ordering::SeqCst);
+
+    if should_dim && !was_dimmed {
+        if let Ok(mut manager) = DEV_MANAGER.lock() {
+            manager.light_off();
+            info!(
+                "Low-battery lighting engaged at {:.1}% (threshold {:.1}%)",
+                battery_pct, threshold_pct,
+            );
+        }
+    } else if !should_dim && was_dimmed {
+        if let Ok(mut manager) = DEV_MANAGER.lock() {
+            manager.restore_light();
+            info!(
+                "Low-battery lighting cleared at {:.1}% (threshold {:.1}%)",
+                battery_pct, threshold_pct,
+            );
+        }
     }
 }

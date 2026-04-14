@@ -194,7 +194,11 @@ impl KeyboardData {
         };
     }
 
-    pub fn update_kbd(&self, laptop: &mut device::RazerLaptop, last_sent_rows: &mut Option<[RowData; ROWS]>) -> bool {
+    pub fn update_kbd(
+        &self,
+        laptop: &mut device::RazerLaptop,
+        last_sent_rows: &mut Option<[RowData; ROWS]>,
+    ) -> bool {
         // Only send rows that actually changed. Rewriting the full frame at 10 FPS
         // creates unnecessary EC/HID traffic and worsens PRIME flicker under load.
         let mut changed = false;

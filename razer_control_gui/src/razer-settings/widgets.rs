@@ -2,8 +2,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use relm4::gtk;
-use relm4::gtk::prelude::*;
 use relm4::gtk::cairo;
+use relm4::gtk::prelude::*;
 
 /// HSV Color Wheel widget for color selection.
 pub struct ColorWheel {
@@ -36,7 +36,13 @@ impl ColorWheel {
                 let (r, g, b) = hsv_to_rgb(i as f64, 1.0, 1.0);
                 cr.set_source_rgb(r, g, b);
                 cr.move_to(cx, cy);
-                cr.arc(cx, cy, radius, a1 - std::f64::consts::FRAC_PI_2, a2 - std::f64::consts::FRAC_PI_2);
+                cr.arc(
+                    cx,
+                    cy,
+                    radius,
+                    a1 - std::f64::consts::FRAC_PI_2,
+                    a2 - std::f64::consts::FRAC_PI_2,
+                );
                 cr.close_path();
                 let _ = cr.fill();
             }
@@ -91,7 +97,11 @@ impl ColorWheel {
 
         drawing_area.add_controller(drag);
 
-        ColorWheel { widget: drawing_area, hue: hue_c, saturation: sat_c }
+        ColorWheel {
+            widget: drawing_area,
+            hue: hue_c,
+            saturation: sat_c,
+        }
     }
 
     pub fn get_rgb(&self) -> (u8, u8, u8) {
@@ -107,7 +117,13 @@ impl ColorWheel {
     }
 }
 
-fn update_from_pos(da: &gtk::DrawingArea, hue: &Rc<Cell<f64>>, sat: &Rc<Cell<f64>>, x: f64, y: f64) {
+fn update_from_pos(
+    da: &gtk::DrawingArea,
+    hue: &Rc<Cell<f64>>,
+    sat: &Rc<Cell<f64>>,
+    x: f64,
+    y: f64,
+) {
     let w = da.width() as f64;
     let h = da.height() as f64;
     let cx = w / 2.0;

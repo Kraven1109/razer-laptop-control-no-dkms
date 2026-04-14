@@ -1,13 +1,13 @@
-use serde::{Deserialize, Serialize};
-use serde_big_array::BigArray;
-use std::{thread, time, io, fs};
+use crate::battery;
+use crate::config;
+use dbus::blocking::Connection;
 use hidapi::HidApi;
 use lazy_static::lazy_static;
 use log::*;
-use crate::config;
-use crate::battery;
-use dbus::blocking::Connection;
+use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
 use service::SupportedDevice;
+use std::{fs, io, thread, time};
 
 const RAZER_VENDOR_ID: u16 = 0x1532;
 const REPORT_SIZE: usize = 91;
@@ -34,13 +34,13 @@ pub struct RazerPacket {
 }
 
 impl RazerPacket {
-// Command status
-    const RAZER_CMD_NEW:u8 = 0x00;
+    // Command status
+    const RAZER_CMD_NEW: u8 = 0x00;
     // const RAZER_CMD_BUSY:u8 = 0x01;
-    const RAZER_CMD_SUCCESSFUL:u8 = 0x02;
+    const RAZER_CMD_SUCCESSFUL: u8 = 0x02;
     // const RAZER_CMD_FAILURE:u8 = 0x03;
     // const RAZER_CMD_TIMEOUT:u8 =0x04;
-    const RAZER_CMD_NOT_SUPPORTED:u8 = 0x05;
+    const RAZER_CMD_NOT_SUPPORTED: u8 = 0x05;
 
     fn new(command_class: u8, command_id: u8, data_size: u8) -> RazerPacket {
         return RazerPacket {
@@ -75,16 +75,16 @@ impl RazerPacket {
 
 const DEVICE_FILE: &str = "/usr/share/razercontrol/laptops.json";
 pub struct DeviceManager {
-    pub device: Option <RazerLaptop>,
+    pub device: Option<RazerLaptop>,
     supported_devices: Vec<SupportedDevice>,
-    pub config: Option <config::Configuration>,
+    pub config: Option<config::Configuration>,
     /// Session-only fan overrides (RPM per AC state, not persisted to config).
     /// 0 = auto mode. Reset to session defaults on startup via reset_fan_profiles_to_auto().
     fan_overrides: [i32; 2],
 }
 
 impl DeviceManager {
-    pub fn new () -> DeviceManager {
+    pub fn new() -> DeviceManager {
         return DeviceManager {
             device: None,
             supported_devices: vec![],
@@ -121,7 +121,7 @@ impl DeviceManager {
         return false;
     }
 
-    pub fn read_laptops_file() -> io::Result<DeviceManager > {
+    pub fn read_laptops_file() -> io::Result<DeviceManager> {
         let str: Vec<u8> = fs::read(DEVICE_FILE)?;
         let mut res: DeviceManager = DeviceManager::new();
         res.supported_devices = serde_json::from_slice(str.as_slice())?;
@@ -158,7 +158,7 @@ impl DeviceManager {
     pub fn restore_light(&mut self) {
         let mut brightness = 0;
         let mut logo_state = 0;
-        let mut ac:usize = 0;
+        let mut ac: usize = 0;
         if let Some(laptop) = self.get_device() {
             ac = laptop.get_ac_state();
         }
@@ -250,7 +250,7 @@ impl DeviceManager {
         return true;
     }
 
-    pub fn set_fan_rpm(&mut self, ac:usize, rpm: i32) -> bool {
+    pub fn set_fan_rpm(&mut self, ac: usize, rpm: i32) -> bool {
         let rpm = rpm.max(0);
         // Store session-only override — do NOT persist to config so a crash
         // cannot leave the fan stuck at a manual RPM after restart.
@@ -266,7 +266,7 @@ impl DeviceManager {
         return true;
     }
 
-    pub fn set_logo_led_state(&mut self, ac:usize, logo_state: u8) -> bool {
+    pub fn set_logo_led_state(&mut self, ac: usize, logo_state: u8) -> bool {
         let mut res: bool = false;
         if let Some(config) = self.get_config() {
             config.power[ac].logo_state = logo_state;
@@ -278,10 +278,10 @@ impl DeviceManager {
                 error!("Config write error: {:?}", e);
             }
         }
-             
+
         if let Some(laptop) = self.get_device() {
             let state = laptop.get_ac_state();
-           
+
             if state != ac {
                 res = true;
             } else {
@@ -300,9 +300,9 @@ impl DeviceManager {
         return 0;
     }
 
-    pub fn set_brightness(&mut self, ac:usize, brightness: u8) -> bool {
+    pub fn set_brightness(&mut self, ac: usize, brightness: u8) -> bool {
         let mut res: bool = false;
-        let _val = brightness as u16  * 255 / 100;
+        let _val = brightness as u16 * 255 / 100;
         if let Some(config) = self.get_config() {
             config.power[ac].brightness = _val as u8;
             if config.sync {
@@ -313,7 +313,7 @@ impl DeviceManager {
                 error!("Config write error: {:?}", e);
             }
         }
- 
+
         if let Some(laptop) = self.get_device() {
             let state = laptop.get_ac_state();
             if state != ac {
@@ -330,7 +330,7 @@ impl DeviceManager {
         if let Some(laptop) = self.get_device() {
             if laptop.ac_state as usize == ac {
                 let val = laptop.get_brightness() as u32;
-                let mut perc = val * 100 * 100/ 255;
+                let mut perc = val * 100 * 100 / 255;
                 perc += 50;
                 perc /= 100;
                 return perc as u8;
@@ -339,13 +339,13 @@ impl DeviceManager {
 
         if let Some(config) = self.get_ac_config(ac) {
             let val = config.brightness as u32;
-            let mut perc = val * 100 * 100/ 255;
+            let mut perc = val * 100 * 100 / 255;
             perc += 50;
             perc /= 100;
             return perc as u8;
         }
 
-        return 0
+        return 0;
     }
 
     pub fn get_fan_rpm(&mut self, ac: usize) -> i32 {
@@ -362,7 +362,7 @@ impl DeviceManager {
         0
     }
 
-    pub fn get_power_mode(&mut self, ac:usize) -> u8 {
+    pub fn get_power_mode(&mut self, ac: usize) -> u8 {
         if let Some(laptop) = self.get_device() {
             if laptop.ac_state as usize == ac {
                 return laptop.get_power_mode(0x01);
@@ -376,7 +376,7 @@ impl DeviceManager {
         return 0;
     }
 
-    pub fn get_cpu_boost(&mut self, ac:usize) -> u8 {
+    pub fn get_cpu_boost(&mut self, ac: usize) -> u8 {
         if let Some(laptop) = self.get_device() {
             if laptop.ac_state as usize == ac {
                 return laptop.get_cpu_boost();
@@ -390,7 +390,7 @@ impl DeviceManager {
         return 0;
     }
 
-    pub fn get_gpu_boost(&mut self, ac:usize) -> u8 {
+    pub fn get_gpu_boost(&mut self, ac: usize) -> u8 {
         if let Some(laptop) = self.get_device() {
             if laptop.ac_state as usize == ac {
                 return laptop.get_gpu_boost();
@@ -423,9 +423,12 @@ impl DeviceManager {
     }
 
     pub fn set_ac_state_get(&mut self) {
-        let dbus_system = Connection::new_system()
-            .expect("failed to connect to D-Bus system bus");
-        let proxy_ac = dbus_system.with_proxy("org.freedesktop.UPower", "/org/freedesktop/UPower/devices/line_power_AC0", time::Duration::from_millis(5000));
+        let dbus_system = Connection::new_system().expect("failed to connect to D-Bus system bus");
+        let proxy_ac = dbus_system.with_proxy(
+            "org.freedesktop.UPower",
+            "/org/freedesktop/UPower/devices/line_power_AC0",
+            time::Duration::from_millis(5000),
+        );
         use battery::OrgFreedesktopUPowerDevice;
         if let Ok(online) = proxy_ac.online() {
             if let Some(laptop) = self.get_device() {
@@ -438,7 +441,6 @@ impl DeviceManager {
                 }
             }
         }
-
     }
 
     pub fn get_device(&mut self) -> Option<&mut RazerLaptop> {
@@ -446,17 +448,37 @@ impl DeviceManager {
     }
 
     pub fn set_bho_handler(&mut self, is_on: bool, threshold: u8) -> bool {
-        return self.get_device()
+        return self
+            .get_device()
             .map_or(false, |laptop| laptop.set_bho(is_on, threshold));
     }
 
     pub fn get_bho_handler(&mut self) -> Option<(bool, u8)> {
-        return self.get_device()
-            .and_then(|laptop| laptop.get_bho()
-            .map(|result| byte_to_bho(result)));
-    } 
+        return self
+            .get_device()
+            .and_then(|laptop| laptop.get_bho().map(|result| byte_to_bho(result)));
+    }
 
-    fn get_config(&mut  self) -> Option<&mut config::Configuration> {
+    pub fn set_low_battery_lighting_threshold(&mut self, threshold_pct: f64) -> bool {
+        let threshold_pct = threshold_pct.clamp(0.0, 100.0);
+        if let Some(config) = self.get_config() {
+            config.no_light = threshold_pct;
+            if let Err(error) = config.write_to_file() {
+                error!("Config write error (low battery lighting): {:?}", error);
+                return false;
+            }
+            return true;
+        }
+        false
+    }
+
+    pub fn get_low_battery_lighting_threshold(&mut self) -> f64 {
+        self.get_config()
+            .map(|config| config.no_light)
+            .unwrap_or(0.0)
+    }
+
+    fn get_config(&mut self) -> Option<&mut config::Configuration> {
         return self.config.as_mut();
     }
 
@@ -493,49 +515,52 @@ impl DeviceManager {
         None
     }
 
-    pub fn discover_devices(&mut self)  {
+    pub fn discover_devices(&mut self) {
         match &*HID_API {
             Ok(api) => {
                 // Collect all Razer devices and sort descending by interface number
                 // so high-numbered interfaces (Razer EC control on newer Blade models)
                 // are tried before interface 0 (generic keyboard/consumer).
-                let mut devices: Vec<_> = api.device_list()
+                let mut devices: Vec<_> = api
+                    .device_list()
                     .filter(|d| d.vendor_id() == RAZER_VENDOR_ID)
                     .collect();
 
                 devices.sort_by_key(|d| -(d.interface_number() as i32));
 
                 for device in devices {
-                    let result = self.find_supported_device(device.vendor_id(), device.product_id());
+                    let result =
+                        self.find_supported_device(device.vendor_id(), device.product_id());
                     if let Some(supported_device) = result {
                         let name = supported_device.name.clone();
                         let features = supported_device.features.clone();
                         let fan = supported_device.fan.clone();
                         match api.open_path(device.path()) {
                             Ok(dev) => {
-                                info!("Opened HID device: {} (interface {})",
-                                    name, device.interface_number());
-                                self.device = Some(RazerLaptop::new(
+                                info!(
+                                    "Opened HID device: {} (interface {})",
                                     name,
-                                    features,
-                                    fan,
-                                    dev
-                                ));
+                                    device.interface_number()
+                                );
+                                self.device = Some(RazerLaptop::new(name, features, fan, dev));
                                 return;
-                            },
+                            }
                             Err(e) => {
-                                debug!("Could not open interface {}: {}",
-                                    device.interface_number(), e);
+                                debug!(
+                                    "Could not open interface {}: {}",
+                                    device.interface_number(),
+                                    e
+                                );
                             }
                         };
                     }
                 }
                 error!("No supported Razer HID interface could be opened.\n\
                         Make sure the hidraw device has the right permissions (udev rule installed).");
-            },
+            }
             Err(e) => {
                 error!("HidApi init error: {}", e);
-            },
+            }
         }
     }
 }
@@ -545,8 +570,8 @@ pub struct RazerLaptop {
     features: Vec<String>,
     fan: Vec<u16>,
     device: hidapi::HidDevice,
-    power: u8, // need for fan
-    fan_rpm: u8, // need for power
+    power: u8,    // need for fan
+    fan_rpm: u8,  // need for power
     ac_state: u8, // index config array
     screensaver: bool,
     /// EC command used to read live fan RPM (probed once on first tachometer call).
@@ -555,23 +580,28 @@ pub struct RazerLaptop {
 }
 //
 impl RazerLaptop {
-// LED STORAGE Options
-    const NOSTORE:u8 = 0x00;
-    const VARSTORE:u8 = 0x01;
-// LED definitions
-    const LOGO_LED:u8 = 0x04;
-// effects
-    pub const OFF:u8 = 0x00;
-    pub const WAVE:u8 = 0x01;
-    pub const REACTIVE:u8 = 0x02; // Afterglo
-    pub const BREATHING:u8 = 0x03;
-    pub const SPECTRUM:u8 = 0x04;
-    pub const CUSTOMFRAME:u8 = 0x05;
-    pub const STATIC:u8 = 0x06;
-    pub const STARLIGHT:u8 = 0x19;
+    // LED STORAGE Options
+    const NOSTORE: u8 = 0x00;
+    const VARSTORE: u8 = 0x01;
+    // LED definitions
+    const LOGO_LED: u8 = 0x04;
+    // effects
+    pub const OFF: u8 = 0x00;
+    pub const WAVE: u8 = 0x01;
+    pub const REACTIVE: u8 = 0x02; // Afterglo
+    pub const BREATHING: u8 = 0x03;
+    pub const SPECTRUM: u8 = 0x04;
+    pub const CUSTOMFRAME: u8 = 0x05;
+    pub const STATIC: u8 = 0x06;
+    pub const STARLIGHT: u8 = 0x19;
 
-    pub fn new(name: String, features: Vec<String>, fan: Vec<u16>, device: hidapi::HidDevice) -> RazerLaptop {
-        return RazerLaptop{
+    pub fn new(
+        name: String,
+        features: Vec<String>,
+        fan: Vec<u16>,
+        device: hidapi::HidDevice,
+    ) -> RazerLaptop {
+        return RazerLaptop {
             name,
             features,
             fan,
@@ -611,7 +641,7 @@ impl RazerLaptop {
             self.ac_state = 0;
         }
 
-        return  self.ac_state as usize;
+        return self.ac_state as usize;
     }
 
     pub fn get_ac_state(&mut self) -> usize {
@@ -643,7 +673,7 @@ impl RazerLaptop {
     pub fn set_standard_effect(&mut self, effect_id: u8, params: Vec<u8>) -> bool {
         let mut report: RazerPacket = RazerPacket::new(0x03, 0x0a, 80);
         report.args[0] = effect_id; // effect id
-        // take(79) prevents out-of-bounds write past args[80]
+                                    // take(79) prevents out-of-bounds write past args[80]
         for (idx, &p) in params.iter().take(79).enumerate() {
             report.args[idx + 1] = p;
         }
@@ -699,10 +729,10 @@ impl RazerLaptop {
         report.args[2] = self.power;
         match self.fan_rpm {
             0 => report.args[3] = 0x00,
-            _ => report.args[3] = 0x01
+            _ => report.args[3] = 0x01,
         }
         if let Some(_) = self.send_report(report) {
-            return  true;
+            return true;
         }
 
         return false;
@@ -727,7 +757,7 @@ impl RazerLaptop {
         report.args[0] = 0x00;
         report.args[1] = 0x01;
         report.args[2] = boost;
-        if let Some(_)= self.send_report(report) {
+        if let Some(_) = self.send_report(report) {
             return true;
         }
 
@@ -739,7 +769,7 @@ impl RazerLaptop {
         report.args[0] = 0x00;
         report.args[1] = 0x02;
         report.args[2] = 0x00;
-        if let Some(response) = self.send_report(report){
+        if let Some(response) = self.send_report(report) {
             return response.args[2];
         }
         return 0;
@@ -785,7 +815,7 @@ impl RazerLaptop {
     }
 
     fn set_rpm(&mut self, zone: u8) -> bool {
-        let mut report:RazerPacket = RazerPacket::new(0x0d, 0x01, 0x03);
+        let mut report: RazerPacket = RazerPacket::new(0x0d, 0x01, 0x03);
         // Set fan RPM
         report.args[0] = 0x00;
         report.args[1] = zone;
@@ -831,15 +861,29 @@ impl RazerLaptop {
                 let mut probe = RazerPacket::new(0x0d, cmd_id, 0x02);
                 probe.args[0] = 0x00;
                 probe.args[1] = 0x01;
-                if self.send_report(probe).map(|r| r.args[2] > 0).unwrap_or(false) {
-                    let label = if cmd_id == 0x88 { "tachometer" } else { "set-point" };
-                    info!("fan_rpm: EC 0x0D/0x{:02X} ({}) selected for {}", cmd_id, label, self.name);
+                if self
+                    .send_report(probe)
+                    .map(|r| r.args[2] > 0)
+                    .unwrap_or(false)
+                {
+                    let label = if cmd_id == 0x88 {
+                        "tachometer"
+                    } else {
+                        "set-point"
+                    };
+                    info!(
+                        "fan_rpm: EC 0x0D/0x{:02X} ({}) selected for {}",
+                        cmd_id, label, self.name
+                    );
                     self.fan_read_cmd = Some(cmd_id);
                     break;
                 }
             }
             if self.fan_read_cmd == Some(0) {
-                warn!("fan_rpm: no EC command supported on {} \u{2014} showing configured target", self.name);
+                warn!(
+                    "fan_rpm: no EC command supported on {} \u{2014} showing configured target",
+                    self.name
+                );
             }
         }
 
@@ -897,7 +941,7 @@ impl RazerLaptop {
         // Blade laptops use razer_chroma_misc_get_blade_brightness (0x0E, 0x84)
         let mut report: RazerPacket = RazerPacket::new(0x0E, 0x84, 0x02);
         report.args[0] = 0x01;
-        if let Some(response) = self.send_report(report){
+        if let Some(response) = self.send_report(report) {
             return response.args[1];
         }
         return 0;
@@ -911,8 +955,7 @@ impl RazerLaptop {
         let mut report: RazerPacket = RazerPacket::new(0x07, 0x92, 0x01);
         report.args[0] = 0x00;
 
-        return self.send_report(report)
-            .map(|resp| resp.args[0]);
+        return self.send_report(report).map(|resp| resp.args[0]);
     }
 
     pub fn set_bho(&mut self, is_on: bool, threshold: u8) -> bool {
@@ -927,12 +970,10 @@ impl RazerLaptop {
         let mut report = RazerPacket::new(0x07, 0x12, 0x01);
         report.args[0] = bho_to_byte(is_on, threshold);
 
-        return self.send_report(report)
-            .map_or(false, |r| { 
-                debug!("BHO response: {:?}", r); 
-                true
-            } 
-        );
+        return self.send_report(report).map_or(false, |r| {
+            debug!("BHO response: {:?}", r);
+            true
+        });
     }
 
     /// Read the EC's feature-report response.
@@ -944,7 +985,7 @@ impl RazerLaptop {
         }
     }
 
-    fn send_report(&mut self, mut report: RazerPacket) -> Option<RazerPacket>{
+    fn send_report(&mut self, mut report: RazerPacket) -> Option<RazerPacket> {
         let mut temp_buf: [u8; REPORT_SIZE] = [0x00; REPORT_SIZE];
 
         // Serialize ONCE before the retry loop to avoid repeated allocations.
@@ -954,29 +995,31 @@ impl RazerLaptop {
             match self.device.send_feature_report(&packet_payload) {
                 Ok(_) => {
                     if self.read_response(&mut temp_buf).is_some() {
-                        match bincode::deserialize::<RazerPacket>(&temp_buf){
+                        match bincode::deserialize::<RazerPacket>(&temp_buf) {
                             Ok(response) => {
                                 // BHO status response has a different command_id
                                 if response.command_id == 0x92 {
                                     return Some(response);
                                 }
 
-                                if response.remaining_packets != report.remaining_packets || 
-                                    response.command_class != report.command_class ||
-                                        response.command_id != report.command_id {
-                                            warn!("HID response mismatch: expected class=0x{:02X} cmd=0x{:02X}, got class=0x{:02X} cmd=0x{:02X}",
+                                if response.remaining_packets != report.remaining_packets
+                                    || response.command_class != report.command_class
+                                    || response.command_id != report.command_id
+                                {
+                                    warn!("HID response mismatch: expected class=0x{:02X} cmd=0x{:02X}, got class=0x{:02X} cmd=0x{:02X}",
                                                 report.command_class, report.command_id,
                                                 response.command_class, response.command_id);
-                                        }
-                                else if response.status == RazerPacket::RAZER_CMD_SUCCESSFUL {
+                                } else if response.status == RazerPacket::RAZER_CMD_SUCCESSFUL {
                                     return Some(response);
                                 }
                                 if response.status == RazerPacket::RAZER_CMD_NOT_SUPPORTED {
-                                    debug!("HID command not supported: class=0x{:02X} cmd=0x{:02X}",
-                                        report.command_class, report.command_id);
+                                    debug!(
+                                        "HID command not supported: class=0x{:02X} cmd=0x{:02X}",
+                                        report.command_class, report.command_id
+                                    );
                                     return None; // No point retrying unsupported commands
                                 }
-                            },
+                            }
                             Err(e) => {
                                 warn!("HID deserialize error (attempt {}): {}", attempt + 1, e);
                             }
@@ -984,7 +1027,7 @@ impl RazerLaptop {
                     } else {
                         warn!("HID read timeout (attempt {})", attempt + 1);
                     }
-                },
+                }
                 Err(e) => {
                     error!("HID write error (attempt {}): {}", attempt + 1, e);
                 }
@@ -993,11 +1036,12 @@ impl RazerLaptop {
             thread::sleep(time::Duration::from_millis(1 << attempt));
         }
 
-        error!("HID command failed after 3 attempts: class=0x{:02X} cmd=0x{:02X}",
-            report.command_class, report.command_id);
+        error!(
+            "HID command failed after 3 attempts: class=0x{:02X} cmd=0x{:02X}",
+            report.command_class, report.command_id
+        );
         return None;
     }
-
 }
 
 // top bit flags whether battery health optimization is on or off

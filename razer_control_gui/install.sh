@@ -76,24 +76,8 @@ EOF
         ;;
     esac
 
-    # Install XDG autostart entry so the GUI tray icon launches on login.
-    # Uses --minimized so no window appears; the settings window opens from
-    # the system tray icon when needed.
-    echo "Installing tray autostart entry..."
-    mkdir -p "$HOME/.config/autostart"
-    cat > "$HOME/.config/autostart/razer-settings.desktop" <<AUTOSTART
-[Desktop Entry]
-Type=Application
-Name=Razer Blade Control (tray)
-Comment=Start Razer Blade Control minimized to the system tray
-Exec=/usr/bin/razer-settings --minimized
-Icon=razer-blade-control
-Terminal=false
-X-GNOME-Autostart-enabled=true
-Hidden=false
-AUTOSTART
-
     echo "Installation complete"
+    echo "Tip: enable tray autostart from razer-settings -> System -> Desktop Integration"
 }
 
 uninstall() {
@@ -134,7 +118,7 @@ EOF
         ;;
     esac
 
-    # Remove XDG autostart entry
+    # Remove XDG autostart entry if it was enabled from the GUI
     rm -f "$HOME/.config/autostart/razer-settings.desktop"
 
     echo "Uninstalled"
