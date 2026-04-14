@@ -31,6 +31,8 @@ pub enum DaemonCommand {
     GetPowerLimits { ac: usize },
     SetPowerLimits { ac: usize, pl1_watts: u32, pl2_watts: u32 },
     GetCurrentEffect,
+    /// Live fan RPM from the EC tachometer (model-agnostic).
+    GetFanTachometer,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -80,6 +82,14 @@ pub enum DaemonResponse {
     /// the raw parameter bytes as passed to the effect constructor.
     /// Returns None-equivalent (name="", args=[]) if no effect is loaded.
     GetCurrentEffect { name: String, args: Vec<u8> },
+    /// Live fan RPM from the EC tachometer.
+    GetFanTachometer { rpm: i32 },
+}
+
+/// Returns `true` when the daemon socket is connectable (used by CLI for liveness check).
+#[allow(dead_code)]
+pub fn is_daemon_running() -> bool {
+    UnixStream::connect(SOCKET_PATH).is_ok()
 }
 
 #[allow(dead_code)]
@@ -121,54 +131,43 @@ pub fn send_to_daemon(command: DaemonCommand, mut sock: UnixStream) -> Option<Da
     // Without timeouts the GTK main thread can block indefinitely on a non-responsive daemon.
     let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(1500)));
     let _ = sock.set_write_timeout(Some(std::time::Duration::from_millis(1000)));
-    if let Ok(encoded) = bincode::serialize(&command) {
-        if sock.write_all(&encoded).is_ok() {
-            let mut buf = [0u8; 4096];
-            return match sock.read(&mut buf) {
-                Ok(readed) if readed > 0 => read_from_socked_resp(&buf[0..readed]),
-                Ok(_) => {
-                    eprintln!("No response from daemon");
-                    None
-                }
-                Err(_) => {
-                    eprintln!("Read failed!");
-                    None
-                }
-            };
-        } else {
-            eprintln!("Socket write failed!");
-        }
-    }
-    return None;
-}
 
-/// Deserializes incomming bytes in order to return
-/// a `DaemonResponse`. None is returned if deserializing failed
-fn read_from_socked_resp(bytes: &[u8]) -> Option<DaemonResponse> {
-    match bincode::deserialize::<DaemonResponse>(bytes) {
-        Ok(res) => {
-            println!("RES: {:?}", res);
-            return Some(res);
+    let encoded = bincode::serialize(&command).ok()?;
+    sock.write_all(&encoded).ok()?;
+
+    let mut buf = [0u8; 4096];
+    match sock.read(&mut buf) {
+        Ok(n) if n > 0 => read_from_socket_resp(&buf[..n]),
+        Ok(_) => {
+            eprintln!("No response from daemon");
+            None
         }
         Err(e) => {
-            println!("RES ERROR: {}", e);
-            return None;
+            eprintln!("Read failed: {}", e);
+            None
         }
     }
 }
 
-/// Deserializes incomming bytes in order to return
-/// a `DaemonCommand`. None is returned if deserializing failed
+/// Deserializes incoming bytes into a `DaemonResponse`. Returns None on failure.
+pub fn read_from_socket_resp(bytes: &[u8]) -> Option<DaemonResponse> {
+    match bincode::deserialize::<DaemonResponse>(bytes) {
+        Ok(res) => Some(res),
+        Err(e) => {
+            eprintln!("RES deserialize error: {}", e);
+            None
+        }
+    }
+}
+
+/// Deserializes incoming bytes into a `DaemonCommand`. Returns None on failure.
 #[allow(dead_code)]
 pub fn read_from_socket_req(bytes: &[u8]) -> Option<DaemonCommand> {
     match bincode::deserialize::<DaemonCommand>(bytes) {
-        Ok(res) => {
-            println!("REQ: {:?}", res);
-            return Some(res);
-        }
+        Ok(res) => Some(res),
         Err(e) => {
-            println!("REQ ERROR: {}", e);
-            return None;
+            eprintln!("REQ deserialize error: {}", e);
+            None
         }
     }
 }

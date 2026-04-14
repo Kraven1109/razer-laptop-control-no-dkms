@@ -353,8 +353,8 @@ struct RippleParams {
 }
 
 fn main() {
-    if std::fs::metadata(comms::SOCKET_PATH).is_err() {
-        eprintln!("Error. Socket doesn't exit. Is daemon running?");
+    if !comms::is_daemon_running() {
+        eprintln!("Error: cannot connect to daemon. Is daemon running?");
         std::process::exit(1);
     }
 

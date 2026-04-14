@@ -161,6 +161,12 @@ fn gpu_monitor_on_ac() -> bool {
 /// see memo.md "Archived — PRIME Anti-Flicker Guard Design" for reference.
 pub fn start_gpu_load_monitor_task() -> JoinHandle<()> {
     thread::spawn(|| {
+        // Do one query immediately so the cache is populated before the first
+        // GUI poll arrives (which may happen within a second of startup).
+        if let Some(status) = gpu::query_nvidia_gpu() {
+            gpu::store_gpu_cache(&status);
+        }
+
         loop {
             let on_ac = gpu_monitor_on_ac();
             thread::sleep(std::time::Duration::from_secs(if on_ac { 3 } else { 10 }));
@@ -407,7 +413,6 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
             comms::DaemonCommand::SetEffect{ name, params } => {
                 let mut res = false;
                 if let Ok(mut k) = EFFECT_MANAGER.lock() {
-                    res = true;
                     let effect = match name.as_str() {
                         "static" => Some(kbd::effects::Static::new(params)),
                         "static_gradient" => Some(kbd::effects::StaticGradient::new(params)),
@@ -425,15 +430,18 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                     if let Some(laptop) = d.get_device() {
                         if let Some(e) = effect {
                             k.pop_effect(laptop); // Remove old layer
-                            k.push_effect(
-                                e,
-                                [true; 90]
-                                );
-                        } else {
-                            res = false
+                            k.push_effect(e, [true; 90]);
+                            res = true; // only set true after push_effect succeeds
                         }
-                    } else {
-                        res = false;
+                    }
+                }
+                // Persist immediately so effects survive a crash / force-kill.
+                if res {
+                    if let Ok(mut k) = EFFECT_MANAGER.lock() {
+                        let json = k.save();
+                        if let Err(e) = config::Configuration::write_effects_save(json) {
+                            error!("Failed to save effects: {}", e);
+                        }
                     }
                 }
                 Some(comms::DaemonResponse::SetEffect{result: res})
@@ -475,8 +483,8 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
             }
             comms::DaemonCommand::GetDeviceName => {
                 let name = match &d.device {
-                    Some(device) => device.get_name(),
-                    None => "Unknown Device".into()
+                    Some(device) => device.get_name().to_string(),
+                    None => "Unknown Device".to_string()
                 };
                 return Some(comms::DaemonResponse::GetDeviceName { name });
             }
@@ -567,6 +575,10 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                     .and_then(|mut em| em.get_current_effect_info());
                 let (name, args) = info.unwrap_or_else(|| (String::new(), Vec::new()));
                 return Some(comms::DaemonResponse::GetCurrentEffect { name, args });
+            }
+
+            comms::DaemonCommand::GetFanTachometer => {
+                Some(comms::DaemonResponse::GetFanTachometer { rpm: d.get_fan_tachometer() })
             }
 
         };

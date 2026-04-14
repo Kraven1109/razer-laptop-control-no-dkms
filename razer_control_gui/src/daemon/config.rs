@@ -60,20 +60,42 @@ impl Configuration {
         };
     }
 
-    pub fn write_to_file(&mut self) -> io::Result<()> {
-        let j: String = serde_json::to_string_pretty(&self)?;
+    pub fn write_to_file(&self) -> io::Result<()> {
+        let dir_path = get_home_directory() + "/.local/share/razercontrol";
+        fs::create_dir_all(&dir_path)?;
+        let j: String = serde_json::to_string_pretty(&self)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         File::create(get_home_directory() + SETTINGS_FILE)?.write_all(j.as_bytes())?;
         Ok(())
     }
 
     pub fn read_from_config() -> io::Result<Configuration> {
         let str = fs::read_to_string(get_home_directory() + SETTINGS_FILE)?;
-        let res: Configuration = serde_json::from_str(str.as_str())?;
+        let res: Configuration = serde_json::from_str(str.as_str())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Ok(res)
     }
 
+    /// Clears any persisted manual fan RPM back to 0 (auto) for all power profiles.
+    /// Called on startup so a daemon crash with a high fan RPM set does not
+    /// leave the fan stuck at speed after a restart.
+    /// Returns true if any value was changed (i.e. a write is needed).
+    pub fn reset_fan_profiles_to_auto(&mut self) -> bool {
+        let mut changed = false;
+        for slot in &mut self.power {
+            if slot.fan_rpm != 0 {
+                slot.fan_rpm = 0;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub fn write_effects_save(json: serde_json::Value) -> io::Result<()> {
-        let j: String = serde_json::to_string_pretty(&json)?;
+        let dir_path = get_home_directory() + "/.local/share/razercontrol";
+        fs::create_dir_all(&dir_path)?;
+        let j: String = serde_json::to_string_pretty(&json)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         File::create(get_home_directory() + EFFECTS_FILE)?.write_all(j.as_bytes())?;
         Ok(())
     }
