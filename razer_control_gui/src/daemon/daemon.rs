@@ -205,10 +205,20 @@ fn gpu_monitor_on_ac() -> bool {
 }
 
 /// Polls the GPU every 3 s (on AC) or 10 s (on battery) and keeps the status
-/// cache fresh for GUI queries.  Anti-flicker guard logic has been removed;
-/// see memo.md "Archived — PRIME Anti-Flicker Guard Design" for reference.
+/// cache fresh for GUI queries.
+///
+/// Idle backoff: after 5 consecutive polls where gpu_util==0 and power<15 W
+/// (≈15 s of genuine idle), the poller stops querying for 10 polls (≈30 s) to
+/// allow the NVIDIA runtime-PM system to autosuspend the dGPU.  This prevents
+/// the continuous NVML file-descriptor open/close cycle from blocking suspend.
 pub fn start_gpu_load_monitor_task() -> JoinHandle<()> {
     thread::spawn(|| {
+        const IDLE_SUSPEND_AFTER: u32 = 5;  // 5 × 3 s = 15 s idle → start backoff
+        const IDLE_BACKOFF_POLLS: u32 = 10; // 10 × 3 s = 30 s backoff window
+
+        let mut idle_count: u32 = 0;
+        let mut backoff_remaining: u32 = 0;
+
         // Do one query immediately so the cache is populated before the first
         // GUI poll arrives (which may happen within a second of startup).
         if gpu::should_query_nvidia(gpu_monitor_on_ac()) {
@@ -223,14 +233,60 @@ pub fn start_gpu_load_monitor_task() -> JoinHandle<()> {
 
             if SYSTEM_SLEEPING.load(Ordering::Relaxed) {
                 gpu::clear_gpu_cache();
+                idle_count = 0;
+                backoff_remaining = 0;
                 continue;
             }
+
+            // During backoff window: skip querying so the GPU can runtime-suspend.
+            // Store a zero-metric placeholder (stale=true) so the GUI chart goes
+            // dark rather than keeping the last real sample on screen.
+            if backoff_remaining > 0 {
+                backoff_remaining -= 1;
+                let idle_name = gpu::get_cached_gpu_status()
+                    .map(|s| s.name)
+                    .unwrap_or_else(|| "NVIDIA GPU".into());
+                gpu::store_gpu_cache(&gpu::GpuStatus {
+                    name: idle_name,
+                    ..gpu::GpuStatus::default()
+                });
+                continue;
+            }
+
             if !gpu::should_query_nvidia(on_ac) {
+                // GPU is already runtime-suspended — reset idle counter.
                 gpu::clear_gpu_cache();
+                idle_count = 0;
                 continue;
             }
+
             if let Some(status) = gpu::query_nvidia_gpu() {
+                // Idle detection: gpu_util==0 and low power means display-only
+                // overhead or genuine deep idle.  After IDLE_SUSPEND_AFTER
+                // consecutive such samples, enter backoff to let the GPU sleep.
+                if status.gpu_util == 0 && status.power_w < 15.0 {
+                    idle_count += 1;
+                    if idle_count >= IDLE_SUSPEND_AFTER {
+                        info!("GPU idle for {} polls, entering {}-poll backoff to allow runtime-suspend",
+                              IDLE_SUSPEND_AFTER, IDLE_BACKOFF_POLLS);
+                        idle_count = 0;
+                        backoff_remaining = IDLE_BACKOFF_POLLS;
+                        // Immediately store zeros so the GUI chart clears on the next tick.
+                        let idle_name = gpu::get_cached_gpu_status()
+                            .map(|s| s.name)
+                            .unwrap_or_else(|| "NVIDIA GPU".into());
+                        gpu::store_gpu_cache(&gpu::GpuStatus {
+                            name: idle_name,
+                            ..gpu::GpuStatus::default()
+                        });
+                        continue;
+                    }
+                } else {
+                    idle_count = 0;
+                }
                 gpu::store_gpu_cache(&status);
+            } else {
+                idle_count = 0;
             }
         }
     })
@@ -680,33 +736,15 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
             }
 
             comms::DaemonCommand::GetGpuStatus => {
-                // Use the cache populated by the GPU load monitor to avoid
-                // spawning a second nvidia-smi per GUI poll cycle.
-                // Fall back to a direct query only if the cache is cold.
-                let on_ac = d
-                    .get_device()
-                    .map(|laptop| laptop.get_ac_state() == 1)
-                    .unwrap_or(true);
-                let status = if let Some(status) = gpu::get_cached_gpu_status() {
-                    status
-                } else if SYSTEM_SLEEPING.load(Ordering::Relaxed)
-                    || !gpu::should_query_nvidia(on_ac)
-                {
-                    gpu::GpuStatus {
-                        name: "NVIDIA GPU (runtime suspended)".into(),
-                        ..gpu::GpuStatus::default()
-                    }
-                } else {
-                    gpu::query_nvidia_gpu()
-                        .map(|s| {
-                            gpu::store_gpu_cache(&s);
-                            s
-                        })
-                        .unwrap_or_else(|| gpu::GpuStatus {
-                            name: "NVIDIA GPU (runtime suspended)".into(),
-                            ..gpu::GpuStatus::default()
-                        })
-                };
+                // Only read from the cache populated by the GPU load monitor.
+                // Direct fallback queries have been removed: they defeated the
+                // idle backoff and would prevent NVIDIA runtime-PM from suspending
+                // the dGPU.  The monitor task populates or zeroes the cache each
+                // poll; a cold cache (startup or sleeping) returns stale=true.
+                let status = gpu::get_cached_gpu_status().unwrap_or_else(|| gpu::GpuStatus {
+                    name: "NVIDIA GPU".into(),
+                    ..gpu::GpuStatus::default()
+                });
                 return Some(comms::DaemonResponse::GetGpuStatus {
                     name: status.name,
                     temp_c: status.temp_c,

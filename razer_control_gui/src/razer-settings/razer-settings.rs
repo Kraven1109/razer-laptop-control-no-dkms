@@ -296,6 +296,47 @@ fn set_low_battery_lighting_threshold(threshold_pct: f64) -> Option<bool> {
     }
 }
 
+fn get_sync() -> Option<bool> {
+    match send_data(comms::DaemonCommand::GetSync())? {
+        comms::DaemonResponse::GetSync { sync } => Some(sync),
+        r => {
+            eprintln!("Unexpected: {r:?}");
+            None
+        }
+    }
+}
+
+fn set_sync(sync: bool) -> Option<bool> {
+    match send_data(comms::DaemonCommand::SetSync { sync })? {
+        comms::DaemonResponse::SetSync { result } => Some(result),
+        r => {
+            eprintln!("Unexpected: {r:?}");
+            None
+        }
+    }
+}
+
+/// Returns the minimum safe fan RPM given the current GPU temperature.
+/// Mirrors Windows safe_min_rpm() — raises the floor when the GPU is hot
+/// to prevent the dGPU from overheating while the fan is on manual control.
+fn safe_min_fan_rpm(gpu_temp_c: i32, min_fan: f64, max_fan: f64) -> f64 {
+    if gpu_temp_c >= 95 {
+        max_fan
+    } else if gpu_temp_c >= 80 {
+        min_fan + (max_fan - min_fan) * 0.35
+    } else {
+        min_fan
+    }
+}
+
+/// Returns the live GPU temperature from the daemon, or 0 if unavailable.
+fn get_gpu_temp() -> i32 {
+    match send_data(comms::DaemonCommand::GetGpuStatus) {
+        Some(comms::DaemonResponse::GetGpuStatus { temp_c, stale, .. }) if !stale => temp_c,
+        _ => 0,
+    }
+}
+
 // ── Main Application Model ───────────────────────────────────────────────
 
 struct App {
@@ -330,9 +371,11 @@ impl SimpleComponent for App {
         };
         let widgets = view_output!();
 
+        // Window title shows the actual device model name.
+        root.set_title(Some(&format!("{} — Control", device.name)));
+
         // Build the view stack
-        let view_stack = adw::ViewStack::new();
-        view_stack.add_titled_with_icon(
+        let view_stack = adw::ViewStack::new();        view_stack.add_titled_with_icon(
             &build_power_page(true, &device),
             Some("ac"),
             "AC",
@@ -515,6 +558,24 @@ fn build_power_page(ac: bool, device: &SupportedDevice) -> gtk::ScrolledWindow {
         group.add(&power_row);
         group.add(&cpu_row);
         group.add(&gpu_row);
+
+        // Sync toggle: only on AC tab — mirrors profiles to Battery when enabled.
+        if ac {
+            let sync_enabled = get_sync().unwrap_or(false);
+            let sync_row = adw::SwitchRow::builder()
+                .title("Sync AC & Battery Profiles")
+                .subtitle("Mirror power profile and brightness settings to both power states")
+                .active(sync_enabled)
+                .build();
+            sync_row.connect_active_notify(move |row| {
+                set_sync(row.is_active());
+                if let Some(s) = get_sync() {
+                    row.set_active(s);
+                }
+            });
+            group.add(&sync_row);
+        }
+
         page.add(&group);
     }
 
@@ -544,27 +605,88 @@ fn build_power_page(ac: bool, device: &SupportedDevice) -> gtk::ScrolledWindow {
         ])));
         mode_row.set_selected(fan_mode);
 
-        let spin_row = adw::SpinRow::with_range(min_fan, max_fan, 100.0);
-        spin_row.set_title("Speed (RPM)");
-        spin_row.set_subtitle("Manual fan speed");
-        spin_row.set_value(if fan_speed == 0 {
-            min_fan
-        } else {
-            fan_speed as f64
-        });
-        spin_row.set_sensitive(fan_mode == 1);
+        // ── Manual RPM row (slider) ────────────────────────────────────────
+        let rpm_row = adw::ActionRow::builder()
+            .title("Speed (RPM)")
+            .subtitle("Manual fan speed — floor raised when GPU is hot")
+            .build();
+        let rpm_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, min_fan, max_fan, 100.0);
+        rpm_scale.set_value(if fan_speed == 0 { min_fan } else { fan_speed as f64 });
+        rpm_scale.set_hexpand(true);
+        rpm_scale.set_valign(gtk::Align::Center);
+        rpm_scale.set_size_request(180, -1);
+        rpm_scale.set_sensitive(fan_mode == 1);
+        rpm_scale.add_mark(min_fan, gtk::PositionType::Bottom, None);
+        rpm_scale.add_mark((min_fan + max_fan) / 2.0, gtk::PositionType::Bottom, None);
+        rpm_scale.add_mark(max_fan, gtk::PositionType::Bottom, None);
 
+        let rpm_val_label = gtk::Label::builder()
+            .label(&if fan_speed == 0 { format!("{min_fan:.0} RPM") } else { format!("{fan_speed} RPM") })
+            .width_chars(9)
+            .xalign(1.0)
+            .css_classes(["monospace"])
+            .build();
+        rpm_row.add_suffix(&rpm_scale);
+        rpm_row.add_suffix(&rpm_val_label);
+
+        // Pending RPM: signal handler only writes, IPC timer reads — no reentrancy.
+        let pending_rpm: Rc<RefCell<Option<i32>>> = Rc::new(RefCell::new(None));
+
+        rpm_scale.connect_value_changed(glib::clone!(
+            #[weak]
+            rpm_val_label,
+            #[strong]
+            pending_rpm,
+            move |s| {
+                let v = s.value().clamp(min_fan, max_fan) as i32;
+                rpm_val_label.set_text(&format!("{v} RPM"));
+                *pending_rpm.borrow_mut() = Some(v);
+            }
+        ));
+
+        // IPC sender (300 ms) — applies safety floor before sending.
+        glib::timeout_add_local(
+            std::time::Duration::from_millis(300),
+            glib::clone!(
+                #[weak]
+                rpm_scale,
+                #[strong]
+                pending_rpm,
+                #[strong]
+                mode_row,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    if mode_row.selected() == 1 {
+                        if let Some(v) = pending_rpm.borrow_mut().take() {
+                            let gpu_temp = get_gpu_temp();
+                            let safe_min = safe_min_fan_rpm(gpu_temp, min_fan, max_fan);
+                            let clamped = (v as f64).max(safe_min) as i32;
+                            let _ = set_fan_speed(ac, clamped);
+                            if let Some(rb) = get_fan_speed(ac) {
+                                if rb > 0 && rb != clamped {
+                                    rpm_scale.set_value(rb as f64);
+                                }
+                            }
+                        }
+                    } else {
+                        // Clear pending if mode changed away from Manual
+                        pending_rpm.borrow_mut().take();
+                    }
+                    glib::ControlFlow::Continue
+                }
+            ),
+        );
+
+        // ── Temperature target row (SpinRow) ──────────────────────────────
         let temp_row = adw::SpinRow::with_range(60.0, 95.0, 1.0);
         temp_row.set_title("Target Temperature");
         temp_row.set_subtitle("Daemon keeps CPU/GPU thermals near this target");
-        temp_row.set_value(if fan_temp_target > 0 {
-            fan_temp_target as f64
-        } else {
-            78.0
-        });
+        temp_row.set_value(if fan_temp_target > 0 { fan_temp_target as f64 } else { 78.0 });
         temp_row.set_sensitive(fan_mode == 2);
 
-        let spin_clone = spin_row.clone();
+        // Mode change handler wires up sensitivity and applies immediate IPC.
+        let rpm_scale_c = rpm_scale.clone();
         let temp_clone = temp_row.clone();
         mode_row.connect_selected_notify(move |row| {
             match row.selected() {
@@ -574,45 +696,22 @@ fn build_power_page(ac: bool, device: &SupportedDevice) -> gtk::ScrolledWindow {
                 }
                 1 => {
                     let _ = set_fan_temperature_target(ac, 0);
-                    let _ = set_fan_speed(ac, spin_clone.value().clamp(min_fan, max_fan) as i32);
+                    let rpm = rpm_scale_c.value().clamp(min_fan, max_fan) as i32;
+                    let _ = set_fan_speed(ac, rpm);
                 }
                 2 => {
                     let _ = set_fan_temperature_target(ac, temp_clone.value() as i32);
                 }
                 _ => {}
             }
-
             let readback_temp = get_fan_temperature_target(ac).unwrap_or(0);
             let readback_rpm = get_fan_speed(ac).unwrap_or(0);
-            let mode = if readback_temp > 0 {
-                2
-            } else if readback_rpm == 0 {
-                0
-            } else {
-                1
-            };
+            let mode = if readback_temp > 0 { 2 } else if readback_rpm == 0 { 0 } else { 1 };
             row.set_selected(mode);
-            spin_clone.set_sensitive(mode == 1);
+            rpm_scale_c.set_sensitive(mode == 1);
             temp_clone.set_sensitive(mode == 2);
-            if readback_rpm > 0 {
-                spin_clone.set_value(readback_rpm as f64);
-            }
-            if readback_temp > 0 {
-                temp_clone.set_value(readback_temp as f64);
-            }
-        });
-
-        let mode_clone = mode_row.clone();
-        spin_row.connect_value_notify(move |row| {
-            if mode_clone.selected() != 1 {
-                return;
-            }
-            let val = row.value().clamp(min_fan, max_fan) as i32;
-            let _ = set_fan_speed(ac, val);
-            let readback = get_fan_speed(ac).unwrap_or(0);
-            if readback > 0 {
-                row.set_value(readback as f64);
-            }
+            if readback_rpm > 0 { rpm_scale_c.set_value(readback_rpm as f64); }
+            if readback_temp > 0 { temp_clone.set_value(readback_temp as f64); }
         });
 
         let mode_clone = mode_row.clone();
@@ -660,7 +759,7 @@ fn build_power_page(ac: bool, device: &SupportedDevice) -> gtk::ScrolledWindow {
         );
 
         group.add(&mode_row);
-        group.add(&spin_row);
+        group.add(&rpm_row);
         group.add(&temp_row);
         group.add(&live_row);
         page.add(&group);
@@ -672,61 +771,62 @@ fn build_power_page(ac: bool, device: &SupportedDevice) -> gtk::ScrolledWindow {
             .title("Keyboard Brightness")
             .build();
         let brightness = get_brightness(ac).unwrap_or(50);
-        let syncing = Rc::new(RefCell::new(false));
 
-        let spin_row = adw::SpinRow::with_range(0.0, 100.0, 1.0);
-        spin_row.set_title("Brightness");
-        spin_row.set_subtitle("Keyboard backlight intensity");
-        spin_row.set_value(brightness as f64);
+        // Slider row — more intuitive drag interaction than SpinRow for 0-100 range.
+        let bright_row = adw::ActionRow::builder()
+            .title("Brightness")
+            .subtitle("Keyboard backlight intensity")
+            .build();
+        let bright_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 100.0, 1.0);
+        bright_scale.set_value(brightness as f64);
+        bright_scale.set_hexpand(true);
+        bright_scale.set_valign(gtk::Align::Center);
+        bright_scale.set_size_request(180, -1);
+        bright_scale.add_mark(0.0,   gtk::PositionType::Bottom, None);
+        bright_scale.add_mark(50.0,  gtk::PositionType::Bottom, None);
+        bright_scale.add_mark(100.0, gtk::PositionType::Bottom, None);
 
-        let syncing_write = syncing.clone();
-        // Debounce: cancel any pending call when the value changes again within 200 ms,
-        // so rapid scrolling does not pile up blocking IPC calls on the main thread.
-        let debounce: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
-        spin_row.connect_value_notify(move |row| {
-            if *syncing_write.borrow() {
-                return;
+        let bright_val_label = gtk::Label::builder()
+            .label(&format!("{}%", brightness))
+            .width_chars(5)
+            .xalign(1.0)
+            .css_classes(["monospace"])
+            .build();
+        bright_row.add_suffix(&bright_scale);
+        bright_row.add_suffix(&bright_val_label);
+
+        // Pending value: signal handler only writes here, IPC timer reads it.
+        // This fully decouples UI events from blocking IPC calls.
+        let pending: Rc<RefCell<Option<u8>>> = Rc::new(RefCell::new(None));
+
+        bright_scale.connect_value_changed(glib::clone!(
+            #[weak]
+            bright_val_label,
+            #[strong]
+            pending,
+            move |s| {
+                let v = s.value().clamp(0.0, 100.0) as u8;
+                bright_val_label.set_text(&format!("{}%", v));
+                *pending.borrow_mut() = Some(v);
             }
-            // Cancel the previous pending IPC call if the user is still scrolling.
-            if let Some(id) = debounce.borrow_mut().take() {
-                id.remove();
-            }
-            let val = row.value().clamp(0.0, 100.0) as u8;
-            let row_weak = row.downgrade();
-            let syncing_d = syncing_write.clone();
-            // Fire the actual IPC 200 ms after the last value change.
-            let id = glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
-                set_brightness(ac, val);
-                if let Some(readback) = get_brightness(ac) {
-                    if readback != val {
-                        *syncing_d.borrow_mut() = true;
-                        if let Some(r) = row_weak.upgrade() {
-                            r.set_value(readback as f64);
-                        }
-                        *syncing_d.borrow_mut() = false;
-                    }
-                }
-                glib::ControlFlow::Break
-            });
-            *debounce.borrow_mut() = Some(id);
-        });
+        ));
 
-        let syncing_poll = syncing.clone();
-        glib::timeout_add_seconds_local(
-            2,
+        // IPC sender: coalesces all drag events into one call per 300 ms tick.
+        glib::timeout_add_local(
+            std::time::Duration::from_millis(300),
             glib::clone!(
                 #[weak]
-                spin_row,
+                bright_scale,
+                #[strong]
+                pending,
                 #[upgrade_or]
                 glib::ControlFlow::Break,
                 move || {
-                    if check_if_running_on_ac_power() == Some(ac) {
-                        if let Some(readback) = get_brightness(ac) {
-                            let current = spin_row.value().round().clamp(0.0, 100.0) as u8;
-                            if current != readback {
-                                *syncing_poll.borrow_mut() = true;
-                                spin_row.set_value(readback as f64);
-                                *syncing_poll.borrow_mut() = false;
+                    if let Some(v) = pending.borrow_mut().take() {
+                        set_brightness(ac, v);
+                        if let Some(rb) = get_brightness(ac) {
+                            if rb != v {
+                                bright_scale.set_value(rb as f64);
                             }
                         }
                     }
@@ -735,7 +835,32 @@ fn build_power_page(ac: bool, device: &SupportedDevice) -> gtk::ScrolledWindow {
             ),
         );
 
-        group.add(&spin_row);
+        // External sync poll (every 2 s) — reflects daemon changes not made from this page.
+        glib::timeout_add_seconds_local(
+            2,
+            glib::clone!(
+                #[weak]
+                bright_scale,
+                #[strong]
+                pending,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move || {
+                    // Skip if user is actively editing (a pending value is queued).
+                    if check_if_running_on_ac_power() == Some(ac) && pending.borrow().is_none() {
+                        if let Some(readback) = get_brightness(ac) {
+                            let current = bright_scale.value().round() as u8;
+                            if current != readback {
+                                bright_scale.set_value(readback as f64);
+                            }
+                        }
+                    }
+                    glib::ControlFlow::Continue
+                }
+            ),
+        );
+
+        group.add(&bright_row);
         page.add(&group);
     }
 
@@ -1722,6 +1847,12 @@ for (var i = 0; i < wins.length; i++) {
         let (gpu_tx, gpu_rx) = std::sync::mpsc::channel::<Option<GpuSample>>();
         let poll_in_flight = Arc::new(AtomicBool::new(false));
 
+        // Consecutive samples where gpu_util==0 and power is near-idle (<15 W).
+        // After IDLE_CLEAR_AFTER consecutive idle polls the chart history is cleared
+        // so it goes dark rather than showing a flat baseline line endlessly.
+        const IDLE_CLEAR_AFTER: u32 = 3; // 3 × 3 s = 9 s
+        let idle_count: Rc<RefCell<u32>> = Rc::new(RefCell::new(0));
+
         // Timer: non-blocking try_recv on each tick + launch background IPC thread.
         // Main thread never blocks: try_recv() is instant, thread::spawn() is instant.
         {
@@ -1730,6 +1861,7 @@ for (var i = 0; i < wins.length; i++) {
             let csv_t = csv_log.clone();
             let chart_t = chart.clone();
             let in_flight = poll_in_flight;
+            let idle_cnt = idle_count.clone();
             // Cloned strong refs — GLib releases the timer source (and these refs)
             // when the main window closes.
             let tl = temp_label.clone();
@@ -1782,6 +1914,21 @@ for (var i = 0; i < wins.length; i++) {
                         }
                     } else {
                         hist_t.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                    }
+
+                    // Idle hysteresis: after IDLE_CLEAR_AFTER consecutive polls where
+                    // gpu_util==0 and power is near-display-only idle (<15 W), clear
+                    // the chart history so it goes dark instead of showing a flat baseline.
+                    if s.stale {
+                        *idle_cnt.borrow_mut() = IDLE_CLEAR_AFTER; // already stale — fast-path
+                    } else if s.gpu_util == 0 && s.power_w < 15.0 {
+                        let new_cnt = *idle_cnt.borrow() + 1;
+                        *idle_cnt.borrow_mut() = new_cnt;
+                        if new_cnt >= IDLE_CLEAR_AFTER {
+                            hist_t.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                        }
+                    } else {
+                        *idle_cnt.borrow_mut() = 0;
                     }
                     if let Some(ref mut f) = *csv_t.lock().unwrap_or_else(|e| e.into_inner()) {
                         use std::io::Write;

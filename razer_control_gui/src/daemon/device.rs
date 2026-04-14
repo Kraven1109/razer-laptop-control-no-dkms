@@ -2,7 +2,6 @@ use crate::battery;
 use crate::config;
 use dbus::blocking::Connection;
 use hidapi::HidApi;
-use lazy_static::lazy_static;
 use log::*;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
@@ -11,11 +10,6 @@ use std::{fs, io, thread, time};
 
 const RAZER_VENDOR_ID: u16 = 0x1532;
 const REPORT_SIZE: usize = 91;
-
-// Cache the HidApi instance to avoid expensive re-enumeration on every discover_devices() call.
-lazy_static! {
-    static ref HID_API: Result<HidApi, hidapi::HidError> = HidApi::new();
-}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct RazerPacket {
@@ -575,52 +569,52 @@ impl DeviceManager {
     }
 
     pub fn discover_devices(&mut self) {
-        match &*HID_API {
-            Ok(api) => {
-                // Collect all Razer devices and sort descending by interface number
-                // so high-numbered interfaces (Razer EC control on newer Blade models)
-                // are tried before interface 0 (generic keyboard/consumer).
-                let mut devices: Vec<_> = api
-                    .device_list()
-                    .filter(|d| d.vendor_id() == RAZER_VENDOR_ID)
-                    .collect();
+        // Always create a fresh HidApi so post-resume USB re-enumeration is picked up.
+        // The lazy_static cache was intentionally removed: it held stale device paths
+        // from before sleep, causing discover_devices() to silently fail on every resume.
+        let api = match HidApi::new() {
+            Ok(a) => a,
+            Err(e) => { error!("HidApi init error: {}", e); return; }
+        };
+        // Collect all Razer devices and sort descending by interface number
+        // so high-numbered interfaces (Razer EC control on newer Blade models)
+        // are tried before interface 0 (generic keyboard/consumer).
+        let mut devices: Vec<_> = api
+            .device_list()
+            .filter(|d| d.vendor_id() == RAZER_VENDOR_ID)
+            .collect();
 
-                devices.sort_by_key(|d| -(d.interface_number() as i32));
+        devices.sort_by_key(|d| -(d.interface_number() as i32));
 
-                for device in devices {
-                    let result =
-                        self.find_supported_device(device.vendor_id(), device.product_id());
-                    if let Some(supported_device) = result {
-                        let name = supported_device.name.clone();
-                        let features = supported_device.features.clone();
-                        let fan = supported_device.fan.clone();
-                        match api.open_path(device.path()) {
-                            Ok(dev) => {
-                                info!(
-                                    "Opened HID device: {} (interface {})",
-                                    name,
-                                    device.interface_number()
-                                );
-                                self.device = Some(RazerLaptop::new(name, features, fan, dev));
-                                return;
-                            }
-                            Err(e) => {
-                                debug!(
-                                    "Could not open interface {}: {}",
-                                    device.interface_number(),
-                                    e
-                                );
-                            }
-                        };
+        for device in devices {
+            let result =
+                self.find_supported_device(device.vendor_id(), device.product_id());
+            if let Some(supported_device) = result {
+                let name = supported_device.name.clone();
+                let features = supported_device.features.clone();
+                let fan = supported_device.fan.clone();
+                match api.open_path(device.path()) {
+                    Ok(dev) => {
+                        info!(
+                            "Opened HID device: {} (interface {})",
+                            name,
+                            device.interface_number()
+                        );
+                        self.device = Some(RazerLaptop::new(name, features, fan, dev));
+                        return;
                     }
-                }
-                error!("No supported Razer HID interface could be opened.\n\
-                        Make sure the hidraw device has the right permissions (udev rule installed).");
-            }
-            Err(e) => {
-                error!("HidApi init error: {}", e);
+                    Err(e) => {
+                        debug!(
+                            "Could not open interface {}: {}",
+                            device.interface_number(),
+                            e
+                        );
+                    }
+                };
             }
         }
+        error!("No supported Razer HID interface could be opened.\n\
+                Make sure the hidraw device has the right permissions (udev rule installed).");
     }
 }
 
