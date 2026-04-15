@@ -1312,6 +1312,96 @@ fn build_keyboard_page() -> gtk::ScrolledWindow {
     scroll
 }
 
+// ── System-page helper functions ────────────────────────────────────────────
+
+/// Reads /proc/stat aggregate line.  Returns (total_ticks, idle_ticks).
+fn cpu_stat_ticks() -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string("/proc/stat").ok()?;
+    let line = s.lines().next()?;
+    let p: Vec<u64> = line.split_whitespace().skip(1)
+        .filter_map(|v| v.parse().ok()).collect();
+    if p.len() < 4 { return None; }
+    let idle   = p[3] + p.get(4).copied().unwrap_or(0); // idle + iowait
+    let total  = p.iter().sum::<u64>();
+    Some((total, idle))
+}
+
+/// Returns (used_mb, total_mb) from /proc/meminfo.
+fn read_ram_mb() -> (u64, u64) {
+    let s = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let mut total_kb = 0u64;
+    let mut avail_kb = 0u64;
+    for line in s.lines() {
+        let mut parts = line.split_whitespace();
+        match parts.next() {
+            Some("MemTotal:")     => total_kb = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            Some("MemAvailable:") => avail_kb = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            _ => {}
+        }
+    }
+    (total_kb.saturating_sub(avail_kb) / 1024, total_kb / 1024)
+}
+
+/// Returns CPU package temperature in °C from hwmon (coretemp / k10temp / zenpower).
+fn read_cpu_temp_c() -> Option<i32> {
+    let entries = std::fs::read_dir("/sys/class/hwmon").ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(name) = std::fs::read_to_string(path.join("name")) else { continue };
+        let name = name.trim();
+        if name == "coretemp" || name == "k10temp" || name == "zenpower" {
+            if let Ok(v) = std::fs::read_to_string(path.join("temp1_input")) {
+                if let Ok(m) = v.trim().parse::<i32>() { return Some(m / 1000); }
+            }
+        }
+    }
+    None
+}
+
+/// Returns NVMe SSD temperature in °C from hwmon.
+fn read_nvme_temp_c() -> Option<i32> {
+    let entries = std::fs::read_dir("/sys/class/hwmon").ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(name) = std::fs::read_to_string(path.join("name")) else { continue };
+        if name.trim().starts_with("nvme") {
+            if let Ok(v) = std::fs::read_to_string(path.join("temp1_input")) {
+                if let Ok(m) = v.trim().parse::<i32>() { return Some(m / 1000); }
+            }
+        }
+    }
+    None
+}
+
+/// Creates a metric display tile.
+/// Returns (container_box, value_label, subtitle_label) for later update.
+fn make_stat_tile(title: &str, value: &str, subtitle: &str, val_css: &'static str)
+    -> (gtk::Box, gtk::Label, gtk::Label)
+{
+    let tile = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["metric-tile"])
+        .spacing(0).hexpand(true).build();
+    let lbl_t = gtk::Label::builder().label(title)
+        .css_classes(["metric-tile-title"]).halign(gtk::Align::Start).build();
+    let lbl_v = gtk::Label::builder().label(value)
+        .css_classes(["metric-tile-value", val_css]).halign(gtk::Align::Start).build();
+    let lbl_s = gtk::Label::builder().label(subtitle)
+        .css_classes(["metric-tile-sub"]).halign(gtk::Align::Start).wrap(true).build();
+    tile.append(&lbl_t);
+    tile.append(&lbl_v);
+    tile.append(&lbl_s);
+    (tile, lbl_v, lbl_s)
+}
+
+/// Returns the CSS colour class for a GPU/CPU temperature value.
+fn temp_css(temp_c: i32, stale: bool) -> &'static str {
+    if stale || temp_c == 0 { "metric-white" }
+    else if temp_c >= 90     { "metric-red"    }
+    else if temp_c >= 75     { "metric-orange" }
+    else                     { "metric-green"  }
+}
+
 fn build_system_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -1320,74 +1410,141 @@ fn build_system_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
 
     let page = adw::PreferencesPage::new();
 
-    if let Some(comms::DaemonResponse::GetGpuStatus {
-        name,
-        temp_c,
-        gpu_util,
-        stale: _,
-        power_w,
-        power_limit_w,
-        power_max_limit_w,
-        mem_used_mb,
-        mem_total_mb,
-        clock_gpu_mhz,
-        clock_mem_mhz,
-        ..
-    }) = send_data(comms::DaemonCommand::GetGpuStatus)
+    // ── Initial data query ────────────────────────────────────────────
+    // GetGpuStatus only reads the daemon cache — never wakes a suspended dGPU.
+    let (gpu_name, gpu_util_init, gpu_temp_init, gpu_stale_init,
+         power_w_init, power_limit_w_init, _power_max_limit_w_init,
+         mem_used_init, mem_total_init, clock_gpu_init, clock_mem_init) =
+        match send_data(comms::DaemonCommand::GetGpuStatus) {
+            Some(comms::DaemonResponse::GetGpuStatus {
+                name, temp_c, gpu_util, stale, power_w, power_limit_w, power_max_limit_w,
+                mem_used_mb, mem_total_mb, clock_gpu_mhz, clock_mem_mhz, ..
+            }) => (name, gpu_util, temp_c, stale,
+                   power_w, power_limit_w, power_max_limit_w,
+                   mem_used_mb, mem_total_mb, clock_gpu_mhz, clock_mem_mhz),
+            _ => ("NVIDIA GPU".into(), 0u8, 0i32, true,
+                  0.0f32, 0.0f32, 0.0f32, 0u32, 0u32, 0u32, 0u32),
+        };
+    let mem_pct_init = if mem_total_init > 0 { mem_used_init * 100 / mem_total_init } else { 0 };
+
+    // CPU / RAM / temperature — fast sysfs reads, no daemon, no dGPU risk.
+    let cpu_prev: Rc<RefCell<Option<(u64, u64)>>> = Rc::new(RefCell::new(cpu_stat_ticks()));
+    let (ram_used_init, ram_total_init) = read_ram_mb();
+    let cpu_temp_init                   = read_cpu_temp_c();
+    let nvme_temp_init                  = read_nvme_temp_c();
+
+    // ── Status + metric tiles ──────────────────────────────────────────
+    let monitors_group = adw::PreferencesGroup::builder()
+        .title("System Monitor")
+        .description("Real-time GPU, CPU and memory performance")
+        .build();
+
+    // GPU state badge — updated every 3 s by the poll timer.
+    let gpu_badge = gtk::Label::builder()
+        .label(if gpu_stale_init { "GPU: suspended" } else { "GPU: live" })
+        .halign(gtk::Align::Start)
+        .build();
+    gpu_badge.set_css_classes(if gpu_stale_init {
+        &["status-badge", "badge-stale"]
+    } else {
+        &["status-badge", "badge-live"]
+    });
+    monitors_group.add(&gpu_badge);
+
+    // ── Side-by-side GPU/System panels ───────────────────────────────
+    let panels_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12).margin_top(4).margin_bottom(4)
+        .build();
+
+    // ── GPU panel ─────────────────────────────────────────────────────
+    let gpu_panel = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["card"]).spacing(0).hexpand(true).build();
     {
-        let gpu_expander = adw::ExpanderRow::builder()
-            .title("NVIDIA GPU")
-            .subtitle(&name)
-            .expanded(true)
-            .build();
+        let hdr = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
+            .margin_start(14).margin_top(10).margin_bottom(6).spacing(2).build();
+        hdr.append(&gtk::Label::builder().label("GPU")
+            .css_classes(["panel-header"]).halign(gtk::Align::Start).build());
+        hdr.append(&gtk::Label::builder().label(&gpu_name)
+            .css_classes(["panel-subheader"]).halign(gtk::Align::Start).build());
+        gpu_panel.append(&hdr);
+    }
+    let gpu_grid = gtk::Grid::builder()
+        .row_spacing(8).column_spacing(8)
+        .margin_start(12).margin_end(12).margin_bottom(12).build();
+    gpu_grid.set_column_homogeneous(true);
 
-        let temp_label = gtk::Label::builder()
-            .label(&format!("{temp_c}°C"))
-            .css_classes(["monospace"])
-            .build();
-        let usage_label = gtk::Label::builder()
-            .label(&format!("{gpu_util}%"))
-            .css_classes(["monospace"])
-            .build();
-        let mem_pct = if mem_total_mb > 0 {
-            mem_used_mb * 100 / mem_total_mb
-        } else {
-            0
-        };
-        let vram_label = gtk::Label::builder()
-            .label(&format!("{mem_used_mb}/{mem_total_mb} MiB ({mem_pct}%)"))
-            .css_classes(["monospace"])
-            .build();
-        let power_label = gtk::Label::builder()
-            .label(&format!("{power_w:.1} W"))
-            .css_classes(["monospace"])
-            .build();
-        let tgp_label = gtk::Label::builder()
-            .label(&format!(
-                "{power_limit_w:.0} W enforced / {power_max_limit_w:.0} W max"
-            ))
-            .css_classes(["monospace"])
-            .build();
-        let clock_label = gtk::Label::builder()
-            .label(&format!("GPU {clock_gpu_mhz} / Mem {clock_mem_mhz} MHz"))
-            .css_classes(["monospace"])
-            .build();
+    let gpu_util_str  = if gpu_stale_init { "--".into() } else { format!("{}%",    gpu_util_init) };
+    let gpu_temp_str  = if gpu_stale_init { "--".into() } else { format!("{}°C",   gpu_temp_init) };
+    let gpu_vram_str  = if gpu_stale_init { "--".into() } else { format!("{} MB",  mem_used_init) };
+    let gpu_tgp_str   = if gpu_stale_init { "--".into() } else { format!("{:.0} W", power_w_init) };
+    let gpu_clock_str = if gpu_stale_init { "--".into() } else { format!("{} MHz", clock_gpu_init) };
 
-        let make_row = |title: &str, suffix: &gtk::Label| -> adw::ActionRow {
-            let row = adw::ActionRow::builder().title(title).build();
-            row.add_suffix(suffix);
-            row
-        };
+    let (gpu_util_tile,  gpu_util_lbl,  _)            = make_stat_tile("GPU",  &gpu_util_str,  "Utilization", "metric-green");
+    let (gpu_temp_tile,  gpu_temp_lbl,  _)            = make_stat_tile("Temp", &gpu_temp_str,  "Sensor",      temp_css(gpu_temp_init, gpu_stale_init));
+    let (gpu_vram_tile,  gpu_vram_lbl,  gpu_vram_sub) = make_stat_tile("VRAM", &gpu_vram_str,  "Utilization", "metric-purple");
+    let (gpu_tgp_tile,   gpu_tgp_lbl,   gpu_tgp_sub) = make_stat_tile("TGP",  &gpu_tgp_str,   "Power draw",  "metric-cyan");
+    let (gpu_clock_tile, gpu_clock_lbl, gpu_clock_sub)= make_stat_tile("Core", &gpu_clock_str, "Clock",       "metric-white");
 
-        gpu_expander.add_row(&make_row("Temperature", &temp_label));
-        gpu_expander.add_row(&make_row("GPU Usage", &usage_label));
-        gpu_expander.add_row(&make_row("VRAM", &vram_label));
-        gpu_expander.add_row(&make_row("Power Draw", &power_label));
-        gpu_expander.add_row(&make_row("TGP Limit", &tgp_label));
-        gpu_expander.add_row(&make_row("Clocks", &clock_label));
+    if !gpu_stale_init {
+        gpu_vram_sub.set_text(&format!("/ {} MB · {}%",   mem_total_init, mem_pct_init));
+        gpu_tgp_sub.set_text( &format!("/ {:.0} W limit", power_limit_w_init));
+        gpu_clock_sub.set_text(&format!("{} MHz mem",     clock_mem_init));
+    }
+    gpu_grid.attach(&gpu_util_tile,  0, 0, 1, 1);
+    gpu_grid.attach(&gpu_temp_tile,  1, 0, 1, 1);
+    gpu_grid.attach(&gpu_vram_tile,  0, 1, 1, 1);
+    gpu_grid.attach(&gpu_tgp_tile,   1, 1, 1, 1);
+    gpu_grid.attach(&gpu_clock_tile, 0, 2, 2, 1); // spans both columns
+    gpu_panel.append(&gpu_grid);
 
-        // ── Timeline chart ────────────────────────────────────────────
-        const CHART_HISTORY: usize = 20; // 20 samples × 3s = 60s window
+    // ── System panel ──────────────────────────────────────────────────
+    let sys_panel = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["card"]).spacing(0).hexpand(true).build();
+    {
+        let hdr = gtk::Box::builder().orientation(gtk::Orientation::Vertical)
+            .margin_start(14).margin_top(10).margin_bottom(6).spacing(2).build();
+        hdr.append(&gtk::Label::builder().label("System")
+            .css_classes(["panel-header"]).halign(gtk::Align::Start).build());
+        hdr.append(&gtk::Label::builder().label("Performance counters")
+            .css_classes(["panel-subheader"]).halign(gtk::Align::Start).build());
+        sys_panel.append(&hdr);
+    }
+    let sys_grid = gtk::Grid::builder()
+        .row_spacing(8).column_spacing(8)
+        .margin_start(12).margin_end(12).margin_bottom(12).build();
+    sys_grid.set_column_homogeneous(true);
+
+    let ram_gb       = ram_used_init as f64 / 1024.0;
+    let ram_total_gb = ram_total_init as f64 / 1024.0;
+    let ram_pct      = if ram_total_init > 0 { ram_used_init * 100 / ram_total_init } else { 0 };
+
+    let (cpu_util_tile,  cpu_util_lbl,  _)           = make_stat_tile("CPU",      "--",  "Utilization",  "metric-green");
+    let (cpu_ram_tile,   cpu_ram_lbl,   cpu_ram_sub) = make_stat_tile(
+        "RAM", &format!("{:.1} GB", ram_gb),
+        &format!("/ {:.0} GB \u{00b7} {}% used", ram_total_gb, ram_pct), "metric-green");
+    let (cpu_temp_tile,  cpu_temp_lbl,  _)           = make_stat_tile(
+        "CPU Temp", &cpu_temp_init.map_or("--".into(), |t| format!("{}°C", t)),
+        "Package sensor", "metric-orange");
+    let (nvme_temp_tile, nvme_temp_lbl, _)           = make_stat_tile(
+        "SSD Temp", &nvme_temp_init.map_or("--".into(), |t| format!("{}°C", t)),
+        "NVMe sensor", "metric-cyan");
+
+    sys_grid.attach(&cpu_util_tile,  0, 0, 1, 1);
+    sys_grid.attach(&cpu_ram_tile,   1, 0, 1, 1);
+    sys_grid.attach(&cpu_temp_tile,  0, 1, 1, 1);
+    sys_grid.attach(&nvme_temp_tile, 1, 1, 1, 1);
+    sys_panel.append(&sys_grid);
+
+    panels_box.append(&gpu_panel);
+    panels_box.append(&sys_panel);
+    monitors_group.add(&panels_box);
+    page.add(&monitors_group);
+
+    // ── Timeline chart ────────────────────────────────────────────────
+    const CHART_HISTORY: usize = 20; // 20 samples × 3s = 60s window
 
         #[derive(Clone, Copy, Default)]
         struct Sample {
@@ -1399,19 +1556,21 @@ fn build_system_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
 
         let history: Arc<Mutex<VecDeque<Sample>>> =
             Arc::new(Mutex::new(VecDeque::with_capacity(CHART_HISTORY + 1)));
-        let tgp_limit: Arc<Mutex<f64>> = Arc::new(Mutex::new(power_limit_w as f64));
+        let tgp_limit: Arc<Mutex<f64>> = Arc::new(Mutex::new(power_limit_w_init as f64));
         {
             let mut h = history.lock().unwrap();
-            h.push_back(Sample {
-                temp_c: temp_c as f64,
-                gpu_pct: gpu_util as f64,
-                vram_pct: if mem_total_mb > 0 {
-                    mem_used_mb as f64 * 100.0 / mem_total_mb as f64
-                } else {
-                    0.0
-                },
-                power_w: power_w as f64,
-            });
+            if !gpu_stale_init {
+                h.push_back(Sample {
+                    temp_c: gpu_temp_init as f64,
+                    gpu_pct: gpu_util_init as f64,
+                    vram_pct: if mem_total_init > 0 {
+                        mem_used_init as f64 * 100.0 / mem_total_init as f64
+                    } else {
+                        0.0
+                    },
+                    power_w: power_w_init as f64,
+                });
+            }
         }
 
         let chart_group = adw::PreferencesGroup::builder()
@@ -1820,11 +1979,7 @@ for (var i = 0; i < wins.length; i++) {
 
         chart_group.add(&chart);
         chart_group.add(&btn_row);
-        page.add(&chart_group); // 1. chart is first
-
-        let gpu_group = adw::PreferencesGroup::new();
-        gpu_group.add(&gpu_expander);
-        page.add(&gpu_group); // 2. GPU info (collapsible, expanded)
+        page.add(&chart_group);
 
         // ── Background GPU poll: IPC runs off the GTK main thread ──────────────────────────
         // Struct for passing GPU data through the channel (must be Send).
@@ -1835,6 +1990,7 @@ for (var i = 0; i < wins.length; i++) {
             stale: bool,
             power_w: f32,
             power_limit_w: f32,
+            #[allow(dead_code)]
             power_max_limit_w: f32,
             mem_used_mb: u32,
             mem_total_mb: u32,
@@ -1864,37 +2020,81 @@ for (var i = 0; i < wins.length; i++) {
             let idle_cnt = idle_count.clone();
             // Cloned strong refs — GLib releases the timer source (and these refs)
             // when the main window closes.
-            let tl = temp_label.clone();
-            let ul = usage_label.clone();
-            let vl = vram_label.clone();
-            let pl = power_label.clone();
-            let tpl = tgp_label.clone();
-            let cl = clock_label.clone();
+            let gpu_badge_t  = gpu_badge.clone();
+            let gpu_util_l   = gpu_util_lbl.clone();
+            let gpu_temp_l   = gpu_temp_lbl.clone();
+            let gpu_vram_l   = gpu_vram_lbl.clone();
+            let gpu_vram_s   = gpu_vram_sub.clone();
+            let gpu_tgp_l    = gpu_tgp_lbl.clone();
+            let gpu_tgp_s    = gpu_tgp_sub.clone();
+            let gpu_clock_l  = gpu_clock_lbl.clone();
+            let gpu_clock_s  = gpu_clock_sub.clone();
+            let cpu_util_l   = cpu_util_lbl.clone();
+            let cpu_ram_l    = cpu_ram_lbl.clone();
+            let cpu_ram_s    = cpu_ram_sub.clone();
+            let cpu_temp_l   = cpu_temp_lbl.clone();
+            let nvme_temp_l  = nvme_temp_lbl.clone();
+            let cpu_prev_t   = cpu_prev.clone();
             glib::timeout_add_seconds_local(3, move || {
                 // 1. Consume any fresh data produced by the previous background thread.
                 if let Ok(Some(s)) = gpu_rx.try_recv() {
-                    tl.set_text(&format!("{}°C", s.temp_c));
-                    ul.set_text(&format!("{}%", s.gpu_util));
-                    let mem_pct = if s.mem_total_mb > 0 {
-                        s.mem_used_mb * 100 / s.mem_total_mb
+                    // GPU metric tiles
+                    let stale = s.stale;
+                    if stale {
+                        gpu_badge_t.set_text("GPU: suspended");
+                        gpu_badge_t.set_css_classes(&["status-badge", "badge-stale"]);
+                        gpu_util_l.set_text("--");
+                        gpu_temp_l.set_text("--");
+                        gpu_vram_l.set_text("--");
+                        gpu_vram_s.set_text("/ -- MB");
+                        gpu_tgp_l.set_text("--");
+                        gpu_tgp_s.set_text("");
+                        gpu_clock_l.set_text("--");
+                        gpu_clock_s.set_text("");
                     } else {
-                        0
-                    };
-                    vl.set_text(&format!(
-                        "{}/{} MiB ({}%)",
-                        s.mem_used_mb, s.mem_total_mb, mem_pct
-                    ));
-                    pl.set_text(&format!("{:.1} W", s.power_w));
-                    tpl.set_text(&format!(
-                        "{:.0} W enforced / {:.0} W max",
-                        s.power_limit_w, s.power_max_limit_w
-                    ));
-                    cl.set_text(&format!(
-                        "GPU {} / Mem {} MHz{}",
-                        s.clock_gpu_mhz,
-                        s.clock_mem_mhz,
-                        if s.stale { " · cached" } else { "" },
-                    ));
+                        gpu_badge_t.set_text("GPU: live");
+                        gpu_badge_t.set_css_classes(&["status-badge", "badge-live"]);
+                        let mem_pct = if s.mem_total_mb > 0 { s.mem_used_mb * 100 / s.mem_total_mb } else { 0 };
+                        gpu_util_l.set_text(&format!("{}%",    s.gpu_util));
+                        gpu_temp_l.set_text(&format!("{}°C",   s.temp_c));
+                        gpu_temp_l.set_css_classes(&["metric-tile-value", temp_css(s.temp_c, false)]);
+                        gpu_vram_l.set_text(&format!("{} MB",  s.mem_used_mb));
+                        gpu_vram_s.set_text(&format!("/ {} MB \u{00b7} {}%", s.mem_total_mb, mem_pct));
+                        gpu_tgp_l.set_text( &format!("{:.0} W", s.power_w));
+                        gpu_tgp_s.set_text( &format!("/ {:.0} W limit", s.power_limit_w));
+                        gpu_clock_l.set_text(&format!("{} MHz", s.clock_gpu_mhz));
+                        gpu_clock_s.set_text(&format!("{} MHz mem", s.clock_mem_mhz));
+                    }
+
+                    // System tiles: CPU/RAM/temp — no dGPU access, safe always.
+                    {
+                        let (used_mb, total_mb) = read_ram_mb();
+                        let gb   = used_mb  as f64 / 1024.0;
+                        let tot  = total_mb as f64 / 1024.0;
+                        let pct  = if total_mb > 0 { used_mb * 100 / total_mb } else { 0 };
+                        cpu_ram_l.set_text(&format!("{:.1} GB", gb));
+                        cpu_ram_s.set_text(&format!("/ {:.0} GB \u{00b7} {}% used", tot, pct));
+                    }
+                    if let Some(t) = read_cpu_temp_c() {
+                        cpu_temp_l.set_text(&format!("{}°C", t));
+                        cpu_temp_l.set_css_classes(&["metric-tile-value", temp_css(t, false)]);
+                    }
+                    if let Some(t) = read_nvme_temp_c() {
+                        nvme_temp_l.set_text(&format!("{}°C", t));
+                    }
+                    // CPU utilization: delta between two successive /proc/stat samples.
+                    {
+                        let cur = cpu_stat_ticks();
+                        let prev = cpu_prev_t.borrow().clone();
+                        if let (Some((ct, ci)), Some((pt, pi))) = (cur, prev) {
+                            let dt = ct.saturating_sub(pt);
+                            let di = ci.saturating_sub(pi);
+                            let util = if dt > 0 { (100 * (dt - di) / dt) as u8 } else { 0 };
+                            cpu_util_l.set_text(&format!("{}%", util));
+                        }
+                        *cpu_prev_t.borrow_mut() = cpu_stat_ticks();
+                    }
+
                     *tgp_t.lock().unwrap_or_else(|e| e.into_inner()) = s.power_limit_w as f64;
                     let sample = Sample {
                         temp_c: s.temp_c as f64,
@@ -1991,7 +2191,6 @@ for (var i = 0; i < wins.length; i++) {
                 glib::ControlFlow::Continue
             });
         }
-    }
 
     // 3. System Information
     {

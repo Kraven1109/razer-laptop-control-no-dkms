@@ -27,3 +27,52 @@
 .suggested-action {
     /* Already styled by Libadwaita */
 }
+
+/* ── System Monitor: metric tiles ─────────────────────────────────── */
+.metric-tile {
+    border-radius: 10px;
+    background-color: rgba(0,0,0,0.20);
+    padding: 12px 14px 10px;
+    min-height: 82px;
+}
+
+.metric-tile-title {
+    font-size: 0.80em;
+    font-weight: 500;
+    opacity: 0.70;
+}
+
+.metric-tile-value {
+    font-size: 1.55em;
+    font-weight: 700;
+    margin-top: 4px;
+}
+
+.metric-tile-sub {
+    font-size: 0.70em;
+    opacity: 0.55;
+    margin-top: 3px;
+}
+
+/* Value colour classes */
+.metric-green  { color: #44ffa1; }
+.metric-orange { color: #ffa040; }
+.metric-red    { color: #ff5555; }
+.metric-purple { color: #cc77ff; }
+.metric-cyan   { color: #40ccff; }
+.metric-white  { color: rgba(255,255,255,0.85); }
+
+/* Panel section headings */
+.panel-header    { font-size: 1.1em; font-weight: 700; }
+.panel-subheader { font-size: 0.82em; opacity: 0.60; }
+
+/* GPU state status badge */
+.status-badge {
+    border-radius: 100px;
+    padding: 3px 12px;
+    font-size: 0.82em;
+    font-weight: 600;
+    margin-bottom: 6px;
+}
+.badge-live  { background-color: rgba(68,255,161,0.18); color: #44ffa1; }
+.badge-stale { background-color: rgba(255,255,255,0.10); color: rgba(255,255,255,0.55); }
