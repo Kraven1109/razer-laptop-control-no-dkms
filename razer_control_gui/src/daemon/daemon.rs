@@ -186,6 +186,15 @@ pub fn start_keyboard_animator_task() -> JoinHandle<()> {
             // is closed during sleep and writes would fail or spin-wait.
             if !SYSTEM_SLEEPING.load(Ordering::Relaxed) {
                 if let (Ok(mut dev), Ok(mut fx)) = (DEV_MANAGER.lock(), EFFECT_MANAGER.lock()) {
+                    // If the current device has accumulated too many consecutive HID
+                    // failures it was likely replaced by the kernel (e.g. USB
+                    // re-enumeration mid-session). Drop it and re-open immediately.
+                    let is_stale = dev.get_device().map_or(false, |l| l.is_stale());
+                    if is_stale {
+                        warn!("HID device stale (consecutive write failures), re-discovering...");
+                        dev.device = None;
+                        dev.discover_devices();
+                    }
                     if let Some(laptop) = dev.get_device() {
                         fx.update(laptop);
                     }

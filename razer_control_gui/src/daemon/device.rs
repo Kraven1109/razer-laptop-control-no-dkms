@@ -576,17 +576,52 @@ impl DeviceManager {
             Ok(a) => a,
             Err(e) => { error!("HidApi init error: {}", e); return; }
         };
-        // Collect all Razer devices and sort descending by interface number
-        // so high-numbered interfaces (Razer EC control on newer Blade models)
-        // are tried before interface 0 (generic keyboard/consumer).
+
         let mut devices: Vec<_> = api
             .device_list()
             .filter(|d| d.vendor_id() == RAZER_VENDOR_ID)
             .collect();
 
-        devices.sort_by_key(|d| -(d.interface_number() as i32));
+        // Log every candidate so resume failures are diagnosable via journalctl.
+        for d in &devices {
+            info!(
+                "Razer HID candidate: PID=0x{:04X} IF={} usage_page=0x{:04X} usage=0x{:04X} path={}",
+                d.product_id(),
+                d.interface_number(),
+                d.usage_page(),
+                d.usage(),
+                d.path().to_string_lossy()
+            );
+        }
 
-        for device in devices {
+        // Sort priority:
+        //   0 — vendor-specific usage page (>=0xFF00): the Razer EC control interface.
+        //       On Linux with hidraw + kernel ≥5.13, hidapi parses the HID report
+        //       descriptor so usage_page is accurate. Windows also uses this filter.
+        //   1 — interface_number == 1: known control interface on Blade 16 (PID 0x029F)
+        //       and most other Razer laptops when usage_page isn't parsed (older kernels).
+        //   3 — other mid-range interface numbers (fallback, descending).
+        //   9 — interface_number == 0: this is always the boot-keyboard interface;
+        //       it never has Feature report support on Razer Blade laptops.
+        //
+        // Previously we sorted by -interface_number, which put Interface 2 (mouse, page
+        // 0x0001) before Interface 1 (EC control, page 0xFF00), so all feature-report
+        // writes went to the mouse hidraw node and were silently discarded by the kernel.
+        devices.sort_by_key(|d| {
+            let up = d.usage_page();
+            if up >= 0xFF00 {
+                0i32
+            } else if d.interface_number() == 1 {
+                1i32
+            } else if d.interface_number() == 0 {
+                9i32
+            } else {
+                // Higher interface numbers first within this bucket.
+                5i32 - (d.interface_number() as i32).min(4)
+            }
+        });
+
+        for device in &devices {
             let result =
                 self.find_supported_device(device.vendor_id(), device.product_id());
             if let Some(supported_device) = result {
@@ -596,17 +631,19 @@ impl DeviceManager {
                 match api.open_path(device.path()) {
                     Ok(dev) => {
                         info!(
-                            "Opened HID device: {} (interface {})",
+                            "Opened HID device: {} (IF={} usage_page=0x{:04X})",
                             name,
-                            device.interface_number()
+                            device.interface_number(),
+                            device.usage_page()
                         );
                         self.device = Some(RazerLaptop::new(name, features, fan, dev));
                         return;
                     }
                     Err(e) => {
-                        debug!(
-                            "Could not open interface {}: {}",
+                        warn!(
+                            "Could not open IF={} (usage_page=0x{:04X}): {}",
                             device.interface_number(),
+                            device.usage_page(),
                             e
                         );
                     }
@@ -630,6 +667,10 @@ pub struct RazerLaptop {
     /// EC command used to read live fan RPM (probed once on first tachometer call).
     /// Some(0x88) = tachometer, Some(0x81) = set-point, Some(0) = unsupported.
     fan_read_cmd: Option<u8>,
+    /// Tracks consecutive HID I/O failures. After 5 failures the device is
+    /// considered stale (e.g. re-enumeration mid-session) and the daemon will
+    /// drop it and call discover_devices() again.
+    consecutive_failures: u32,
 }
 //
 impl RazerLaptop {
@@ -664,7 +705,15 @@ impl RazerLaptop {
             ac_state: 0,
             screensaver: false,
             fan_read_cmd: None,
+            consecutive_failures: 0,
         };
+    }
+
+    /// Returns true when accumulated HID failures suggest the device handle is stale
+    /// (e.g. the hidraw node was replaced after USB re-enumeration mid-session).
+    /// The daemon's animation thread calls this and re-opens the device if needed.
+    pub fn is_stale(&self) -> bool {
+        self.consecutive_failures >= 5
     }
 
     pub fn set_screensaver(&mut self, active: bool) {
@@ -1033,7 +1082,10 @@ impl RazerLaptop {
     fn read_response(&self, buf: &mut [u8; REPORT_SIZE]) -> Option<usize> {
         thread::sleep(time::Duration::from_millis(1));
         match self.device.get_feature_report(buf) {
-            Ok(size) if size == REPORT_SIZE => Some(size),
+            // Accept size >= REPORT_SIZE: on some Linux/hidraw configurations the
+            // ioctl returns REPORT_SIZE+1 bytes (report ID prepended), which is
+            // still a valid full response.
+            Ok(size) if size >= REPORT_SIZE => Some(size),
             _ => None,
         }
     }
@@ -1052,6 +1104,7 @@ impl RazerLaptop {
                             Ok(response) => {
                                 // BHO status response has a different command_id
                                 if response.command_id == 0x92 {
+                                    self.consecutive_failures = 0;
                                     return Some(response);
                                 }
 
@@ -1063,6 +1116,7 @@ impl RazerLaptop {
                                                 report.command_class, report.command_id,
                                                 response.command_class, response.command_id);
                                 } else if response.status == RazerPacket::RAZER_CMD_SUCCESSFUL {
+                                    self.consecutive_failures = 0;
                                     return Some(response);
                                 }
                                 if response.status == RazerPacket::RAZER_CMD_NOT_SUPPORTED {
@@ -1070,7 +1124,10 @@ impl RazerLaptop {
                                         "HID command not supported: class=0x{:02X} cmd=0x{:02X}",
                                         report.command_class, report.command_id
                                     );
-                                    return None; // No point retrying unsupported commands
+                                    // "Not supported" is a valid EC reply — the interface is
+                                    // working, just this particular command isn't available.
+                                    self.consecutive_failures = 0;
+                                    return None;
                                 }
                             }
                             Err(e) => {
@@ -1089,9 +1146,10 @@ impl RazerLaptop {
             thread::sleep(time::Duration::from_millis(1 << attempt));
         }
 
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         error!(
-            "HID command failed after 3 attempts: class=0x{:02X} cmd=0x{:02X}",
-            report.command_class, report.command_id
+            "HID command failed after 3 attempts (consecutive_failures={}): class=0x{:02X} cmd=0x{:02X}",
+            self.consecutive_failures, report.command_class, report.command_id
         );
         return None;
     }
