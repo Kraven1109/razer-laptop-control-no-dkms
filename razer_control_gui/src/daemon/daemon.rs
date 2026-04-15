@@ -194,6 +194,22 @@ pub fn start_keyboard_animator_task() -> JoinHandle<()> {
                         warn!("HID device stale (consecutive write failures), re-discovering...");
                         dev.device = None;
                         dev.discover_devices();
+                        // Sync the runtime screensaver flag onto the new RazerLaptop instance
+                        // (new instances default to screensaver=false, which is wrong when the
+                        // display is still blanked).  Then, if the screen is active, restore the
+                        // configured brightness so the KB wakes up even if the screensaver
+                        // ActiveChanged(false) signal already fired before the device came back.
+                        let ss = dev.screensaver_active;
+                        if let Some(laptop) = dev.get_device() {
+                            laptop.set_screensaver(ss);
+                        }
+                        if dev.device.is_some() && !ss {
+                            dev.restore_light();
+                            info!("Restored KB brightness after stale HID re-open");
+                        }
+                        // Force the effect manager to re-send every row to the new device
+                        // (otherwise the diff logic may skip rows the new device hasn't seen).
+                        fx.clear_row_cache();
                     }
                     if let Some(laptop) = dev.get_device() {
                         fx.update(laptop);
@@ -392,6 +408,21 @@ fn start_screensaver_monitor_task() -> JoinHandle<()> {
                             d.light_off();
                         } else {
                             d.restore_light();
+                            // Belt-and-suspenders: retry brightness restore 600 ms later.
+                            // The HID device may be momentarily unresponsive right after the
+                            // display wakes from DPMS / USB autosuspend, causing the first
+                            // write above to fail silently.  A second attempt after the USB
+                            // stack has had time to resume the device covers this race.
+                            thread::spawn(|| {
+                                thread::sleep(std::time::Duration::from_millis(600));
+                                if let Ok(mut d) = DEV_MANAGER.lock() {
+                                    if !d.screensaver_active
+                                        && !SYSTEM_SLEEPING.load(Ordering::Relaxed)
+                                    {
+                                        d.restore_light();
+                                    }
+                                }
+                            });
                         }
                     }
                     Err(e) => error!("DEV_MANAGER lock failed in screensaver handler: {}", e),

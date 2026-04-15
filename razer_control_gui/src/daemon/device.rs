@@ -75,6 +75,9 @@ pub struct DeviceManager {
     /// Session-only fan overrides (RPM per AC state, not persisted to config).
     /// 0 = auto mode. Reset to session defaults on startup via reset_fan_profiles_to_auto().
     fan_overrides: [i32; 2],
+    /// Tracks whether the screensaver/display-blank is active. Survives HID device re-opens
+    /// so that stale-recovery in the animator thread can restore brightness correctly.
+    pub screensaver_active: bool,
 }
 
 impl DeviceManager {
@@ -84,6 +87,7 @@ impl DeviceManager {
             supported_devices: vec![],
             config: None,
             fan_overrides: [0, 0],
+            screensaver_active: false,
         };
     }
 
@@ -142,6 +146,7 @@ impl DeviceManager {
     }
 
     pub fn light_off(&mut self) {
+        self.screensaver_active = true;
         if let Some(laptop) = self.get_device() {
             laptop.set_screensaver(true);
             laptop.set_brightness(0);
@@ -150,6 +155,12 @@ impl DeviceManager {
     }
 
     pub fn restore_light(&mut self) {
+        self.screensaver_active = false;
+        // If the HID device was lost (stale disconnect) while the screen was
+        // blanked, attempt to re-open it now before writing brightness.
+        if self.device.is_none() {
+            self.discover_devices();
+        }
         let mut brightness = 0;
         let mut logo_state = 0;
         let mut ac: usize = 0;

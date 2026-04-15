@@ -150,6 +150,13 @@ impl EffectManager {
         self.layers.push(EffectLayer::new(effect, mask))
     }
 
+    /// Clears the row-diff cache so the next `update()` call re-sends every
+    /// row to the keyboard.  Call this after the HID device has been replaced
+    /// (stale recovery) so the new device receives a full frame.
+    pub fn clear_row_cache(&mut self) {
+        self.last_sent_rows = None;
+    }
+
     pub fn pop_effect(&mut self, laptop: &mut device::RazerLaptop) {
         self.layers.pop();
         // If no more layers, erase keyboard rendering and set it to black
