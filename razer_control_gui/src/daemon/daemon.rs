@@ -522,11 +522,22 @@ fn start_screensaver_monitor_task() -> JoinHandle<()> {
                 if SYSTEM_STATE.load(Ordering::Relaxed) != sys_state::AWAKE {
                     return true;
                 }
-                // Any screensaver signal means we're past the resume lock screen.
-                RESUME_IN_PROGRESS.store(false, Ordering::Relaxed);
+                let resuming = RESUME_IN_PROGRESS.load(Ordering::Relaxed);
                 if h.arg0 {
-                    set_keyboard_backlight(true, Some("Screensaver active — blanking KB"));
+                    // Screen locked / screensaver started.
+                    // If RESUME_IN_PROGRESS is set, this ActiveChanged(true) is the
+                    // KDE lock screen appearing right after suspend wake — the user
+                    // needs the keyboard lit to type their password.  Do NOT blank the
+                    // KB and do NOT clear RESUME_IN_PROGRESS; wait for the unlock
+                    // signal (ActiveChanged(false)) before resuming normal behaviour.
+                    if resuming {
+                        info!("Screensaver active (signal) during resume — keeping KB on for lock screen");
+                    } else {
+                        set_keyboard_backlight(true, Some("Screensaver active — blanking KB"));
+                    }
                 } else {
+                    // Screen unlocked — always clear the resume guard and restore KB.
+                    RESUME_IN_PROGRESS.store(false, Ordering::Relaxed);
                     set_keyboard_backlight(false, Some("Screensaver inactive (signal) — restoring KB"));
                     // Retry 600 ms later — HID endpoint may still be waking from
                     // USB autosuspend when the signal arrives.
@@ -738,18 +749,28 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
                     // Principle 1: event-driven device readiness via udev.
                     // Condvar wait: zero CPU spin until udev signals HID arrival or
                     // 5-s timeout expires (revise.md principle 2).
+                    const HID_UDEV_WAIT_MS: u64 = 800;
+                    const HID_DISCOVER_ATTEMPTS: u32 = 20;
+                    const HID_DISCOVER_RETRY_MS: u64 = 150;
                     {
                         let (lock, cvar) = &*HID_APPEARED;
                         let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
                         let (_guard, timed_out) = cvar
-                            .wait_timeout_while(guard, std::time::Duration::from_secs(5), |appeared| !*appeared)
+                            .wait_timeout_while(
+                                guard,
+                                std::time::Duration::from_millis(HID_UDEV_WAIT_MS),
+                                |appeared| !*appeared,
+                            )
                             .unwrap_or_else(|e| e.into_inner());
                         if timed_out.timed_out() {
-                            info!("udev HID signal not received within 5s, falling back to polling");
+                            info!(
+                                "udev HID signal not received within {}ms, falling back to polling",
+                                HID_UDEV_WAIT_MS
+                            );
                         }
                     }
                     let mut discovered = false;
-                    for attempt in 0..5_u32 {
+                    for attempt in 0..HID_DISCOVER_ATTEMPTS {
                         let has_device = match DEV_MANAGER.lock() {
                             Ok(mut d) => { d.discover_devices(); d.device.is_some() }
                             Err(e) => { error!("DEV_MANAGER lock failed on resume: {}", e); break; }
@@ -760,11 +781,18 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
                             discovered = true;
                             break;
                         }
-                        warn!("HID not ready on attempt {}, retrying in 300ms", attempt + 1);
-                        thread::sleep(std::time::Duration::from_millis(300));
+                        debug!(
+                            "HID not ready on attempt {}, retrying in {}ms",
+                            attempt + 1,
+                            HID_DISCOVER_RETRY_MS
+                        );
+                        thread::sleep(std::time::Duration::from_millis(HID_DISCOVER_RETRY_MS));
                     }
                     if !discovered {
-                        warn!("HID device unavailable after 5 attempts; backlight will remain off");
+                        warn!(
+                            "HID device unavailable after {} attempts; backlight will remain off",
+                            HID_DISCOVER_ATTEMPTS
+                        );
                     }
                     // Point 1 (revise.md): query D-Bus BEFORE acquiring DEV_MANAGER lock.
                     // If we held the mutex during the 5-s recv_timeout the daemon would
@@ -796,7 +824,69 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
                         // Principle 4: treat wake as total state invalidation.
                         // Actively query AC state and screensaver — don't trust
                         // missed signals from before/during suspend.
+                        let ac_before = d
+                            .get_device()
+                            .map(|laptop| laptop.get_ac_state())
+                            .unwrap_or(1);
                         d.set_ac_state_get();
+                        let mut ac_after = d
+                            .get_device()
+                            .map(|laptop| laptop.get_ac_state())
+                            .unwrap_or(1);
+                        // UPower can briefly report AC=false right after resume even
+                        // while the charger is connected. If we immediately trust that
+                        // transient value we load the battery profile and may restore
+                        // brightness 0. Retry for ~2 s before accepting battery mode.
+                        if ac_before == 1 && ac_after == 0 {
+                            drop(d);
+                            for _ in 0..10 {
+                                thread::sleep(std::time::Duration::from_millis(200));
+                                if let Ok(mut d_retry) = DEV_MANAGER.lock() {
+                                    d_retry.set_ac_state_get();
+                                    ac_after = d_retry
+                                        .get_device()
+                                        .map(|laptop| laptop.get_ac_state())
+                                        .unwrap_or(1);
+                                    if ac_after == 1 {
+                                        info!("Resume AC stabilize: switched back to AC profile after retry");
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Ok(mut d_relock) = DEV_MANAGER.lock() {
+                                if discovered {
+                                    // Always restore KB on wake — user needs visible keys
+                                    // at the lock screen to type their password.
+                                    // The screensaver ActiveChanged(true) signal will blank
+                                    // it again if a real idle screensaver kicks in.
+                                    d_relock.screensaver_active = false;
+                                    d_relock.restore_light();
+                                    info!(
+                                        "Resume: KB restored (screensaver_active was {}, ac_before={}, ac_after={})",
+                                        ss_active,
+                                        ac_before,
+                                        ac_after
+                                    );
+                                }
+                            }
+                            SYSTEM_STATE.store(sys_state::AWAKE, Ordering::SeqCst);
+                            info!("System AWAKE at {}ms after resume", resume_start.elapsed().as_millis());
+                            if discovered {
+                                thread::spawn(|| {
+                                    thread::sleep(std::time::Duration::from_millis(2000));
+                                    if SYSTEM_STATE.load(Ordering::Relaxed) != sys_state::AWAKE {
+                                        return; // another sleep happened, abort
+                                    }
+                                    if let Ok(mut d) = DEV_MANAGER.lock() {
+                                        if !d.screensaver_active {
+                                            info!("Resume brightness retry: re-applying KB backlight");
+                                            d.restore_light();
+                                        }
+                                    }
+                                });
+                            }
+                            return;
+                        }
                         if discovered {
                             // Always restore KB on wake — user needs visible keys
                             // at the lock screen to type their password.
@@ -804,7 +894,12 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
                             // it again if a real idle screensaver kicks in.
                             d.screensaver_active = false;
                             d.restore_light();
-                            info!("Resume: KB restored (was screensaver_active={})", ss_active);
+                            info!(
+                                "Resume: KB restored (screensaver_active was {}, ac_before={}, ac_after={})",
+                                ss_active,
+                                ac_before,
+                                ac_after
+                            );
                         }
                     }
                     // Principle 5: fan PID reset is handled in start_temp_fan_control_task

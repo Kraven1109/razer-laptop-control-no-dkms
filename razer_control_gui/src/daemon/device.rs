@@ -457,6 +457,7 @@ impl DeviceManager {
         );
         use battery::OrgFreedesktopUPowerDevice;
         if let Ok(online) = proxy_ac.online() {
+            info!("set_ac_state_get: UPower AC0 online={}", online);
             if let Some(laptop) = self.get_device() {
                 laptop.set_ac_state(online);
             }
@@ -466,6 +467,8 @@ impl DeviceManager {
                     laptop.set_config(config);
                 }
             }
+        } else {
+            warn!("set_ac_state_get: failed to read UPower AC0 online state");
         }
     }
 
