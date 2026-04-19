@@ -1,6 +1,6 @@
 #![deny(warnings)]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::rc::Rc;
@@ -798,20 +798,26 @@ fn build_power_page(ac: bool, device: &SupportedDevice) -> gtk::ScrolledWindow {
         // Pending value: signal handler only writes here, IPC timer reads it.
         // This fully decouples UI events from blocking IPC calls.
         let pending: Rc<RefCell<Option<u8>>> = Rc::new(RefCell::new(None));
+        let suppress_brightness_write = Rc::new(Cell::new(false));
 
         bright_scale.connect_value_changed(glib::clone!(
             #[weak]
             bright_val_label,
             #[strong]
             pending,
+            #[strong]
+            suppress_brightness_write,
             move |s| {
                 let v = s.value().clamp(0.0, 100.0) as u8;
                 bright_val_label.set_text(&format!("{}%", v));
-                *pending.borrow_mut() = Some(v);
+                if !suppress_brightness_write.get() {
+                    *pending.borrow_mut() = Some(v);
+                }
             }
         ));
 
         // IPC sender: coalesces all drag events into one call per 300 ms tick.
+        let suppress_brightness_write_send = suppress_brightness_write.clone();
         glib::timeout_add_local(
             std::time::Duration::from_millis(300),
             glib::clone!(
@@ -819,6 +825,8 @@ fn build_power_page(ac: bool, device: &SupportedDevice) -> gtk::ScrolledWindow {
                 bright_scale,
                 #[strong]
                 pending,
+                #[strong]
+                suppress_brightness_write_send,
                 #[upgrade_or]
                 glib::ControlFlow::Break,
                 move || {
@@ -826,7 +834,9 @@ fn build_power_page(ac: bool, device: &SupportedDevice) -> gtk::ScrolledWindow {
                         set_brightness(ac, v);
                         if let Some(rb) = get_brightness(ac) {
                             if rb != v {
+                                suppress_brightness_write_send.set(true);
                                 bright_scale.set_value(rb as f64);
+                                suppress_brightness_write_send.set(false);
                             }
                         }
                     }
@@ -843,6 +853,8 @@ fn build_power_page(ac: bool, device: &SupportedDevice) -> gtk::ScrolledWindow {
                 bright_scale,
                 #[strong]
                 pending,
+                #[strong]
+                suppress_brightness_write,
                 #[upgrade_or]
                 glib::ControlFlow::Break,
                 move || {
@@ -851,7 +863,9 @@ fn build_power_page(ac: bool, device: &SupportedDevice) -> gtk::ScrolledWindow {
                         if let Some(readback) = get_brightness(ac) {
                             let current = bright_scale.value().round() as u8;
                             if current != readback {
+                                suppress_brightness_write.set(true);
                                 bright_scale.set_value(readback as f64);
+                                suppress_brightness_write.set(false);
                             }
                         }
                     }
@@ -2003,10 +2017,12 @@ for (var i = 0; i < wins.length; i++) {
         let (gpu_tx, gpu_rx) = std::sync::mpsc::channel::<Option<GpuSample>>();
         let poll_in_flight = Arc::new(AtomicBool::new(false));
 
-        // Consecutive samples where gpu_util==0 and power is near-idle (<15 W).
-        // After IDLE_CLEAR_AFTER consecutive idle polls the chart history is cleared
-        // so it goes dark rather than showing a flat baseline line endlessly.
-        const IDLE_CLEAR_AFTER: u32 = 3; // 3 × 3 s = 9 s
+        // How many consecutive samples have had gpu_util==0 and power<15 W.
+        // When this reaches IDLE_THRESHOLD both the chart AND the tile widgets
+        // flip to "idle" state simultaneously — guaranteed zero desync.
+        // IDLE_THRESHOLD=1 means: on the very first 3s poll at 0% util both
+        // chart and tiles flip, so the flat-zero-line phase never appears.
+        const IDLE_THRESHOLD: u32 = 1;
         let idle_count: Rc<RefCell<u32>> = Rc::new(RefCell::new(0));
 
         // Timer: non-blocking try_recv on each tick + launch background IPC thread.
@@ -2038,10 +2054,21 @@ for (var i = 0; i < wins.length; i++) {
             glib::timeout_add_seconds_local(3, move || {
                 // 1. Consume any fresh data produced by the previous background thread.
                 if let Ok(Some(s)) = gpu_rx.try_recv() {
-                    // GPU metric tiles
+                    // Determine display state: stale = GPU runtime-suspended;
+                    // idle = GPU active but at 0% util for IDLE_THRESHOLD polls.
+                    // Both states show '--' in tiles and clear the chart so that
+                    // tiles and chart always flip at the exact same glib tick.
                     let stale = s.stale;
-                    if stale {
-                        gpu_badge_t.set_text("GPU: suspended");
+                    if !stale && s.gpu_util == 0 && s.power_w < 15.0 {
+                        let cnt = *idle_cnt.borrow() + 1;
+                        *idle_cnt.borrow_mut() = cnt;
+                    } else {
+                        *idle_cnt.borrow_mut() = 0;
+                    }
+                    let idle = stale || *idle_cnt.borrow() >= IDLE_THRESHOLD;
+                    if idle {
+                        let badge_text = if stale { "GPU: suspended" } else { "GPU: idle" };
+                        gpu_badge_t.set_text(badge_text);
                         gpu_badge_t.set_css_classes(&["status-badge", "badge-stale"]);
                         gpu_util_l.set_text("--");
                         gpu_temp_l.set_text("--");
@@ -2106,7 +2133,9 @@ for (var i = 0; i < wins.length; i++) {
                         },
                         power_w: s.power_w as f64,
                     };
-                    if !s.stale {
+                    // Chart history: push samples only while not idle (same condition as tiles).
+                    // Both chart and tiles flip at the exact same glib tick — guaranteed sync.
+                    if !idle {
                         let mut h = hist_t.lock().unwrap_or_else(|e| e.into_inner());
                         h.push_back(sample);
                         while h.len() > CHART_HISTORY {
@@ -2114,21 +2143,6 @@ for (var i = 0; i < wins.length; i++) {
                         }
                     } else {
                         hist_t.lock().unwrap_or_else(|e| e.into_inner()).clear();
-                    }
-
-                    // Idle hysteresis: after IDLE_CLEAR_AFTER consecutive polls where
-                    // gpu_util==0 and power is near-display-only idle (<15 W), clear
-                    // the chart history so it goes dark instead of showing a flat baseline.
-                    if s.stale {
-                        *idle_cnt.borrow_mut() = IDLE_CLEAR_AFTER; // already stale — fast-path
-                    } else if s.gpu_util == 0 && s.power_w < 15.0 {
-                        let new_cnt = *idle_cnt.borrow() + 1;
-                        *idle_cnt.borrow_mut() = new_cnt;
-                        if new_cnt >= IDLE_CLEAR_AFTER {
-                            hist_t.lock().unwrap_or_else(|e| e.into_inner()).clear();
-                        }
-                    } else {
-                        *idle_cnt.borrow_mut() = 0;
                     }
                     if let Some(ref mut f) = *csv_t.lock().unwrap_or_else(|e| e.into_inner()) {
                         use std::io::Write;

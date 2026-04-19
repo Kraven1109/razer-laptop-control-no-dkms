@@ -70,6 +70,14 @@ lazy_static! {
     /// must NOT blank the KB — the user is at the lock screen and needs
     /// visible keys to type their password.
     static ref RESUME_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+    /// Last observed AC online state from startup / UPower AC signal.
+    /// Used as a stable hint during resume where UPower can momentarily
+    /// report AC=false even with the charger connected.
+    static ref LAST_AC_ONLINE: AtomicBool = AtomicBool::new(true);
+    /// Raw keyboard brightness captured right before suspend.
+    /// If resume profile selection transiently lands on a zero-brightness
+    /// profile, we can temporarily recover to this value.
+    static ref PRE_SUSPEND_BRIGHTNESS_RAW: AtomicU8 = AtomicU8::new(0);
 }
 
 #[derive(Clone, Copy)]
@@ -119,6 +127,7 @@ fn main() {
         );
         if let Ok(online) = proxy_ac.online() {
             info!("AC0 online: {:?}", online);
+            LAST_AC_ONLINE.store(online, Ordering::Relaxed);
             d.set_ac_state(online);
             if let Some(config) = d.get_ac_config(online as usize) {
                 if let Some(laptop) = d.get_device() {
@@ -636,6 +645,7 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
                 let online: Option<&bool> = arg::prop_cast(&h.changed_properties, "Online");
                 if let Some(online) = online {
                     info!("AC0 online: {:?}", online);
+                    LAST_AC_ONLINE.store(*online, Ordering::Relaxed);
                     let mut low_battery_threshold = 0.0;
                     if let Ok(mut d) = DEV_MANAGER.lock() {
                         d.set_ac_state(*online);
@@ -694,6 +704,11 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
                 // to wait for the device to re-enumerate.
                 *HID_APPEARED.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
                 if let Ok(mut d) = DEV_MANAGER.lock() {
+                    let pre = d
+                        .get_device()
+                        .map(|laptop| laptop.get_brightness())
+                        .unwrap_or(0);
+                    PRE_SUSPEND_BRIGHTNESS_RAW.store(pre, Ordering::Relaxed);
                     d.light_off();
                     d.device = None; // drop HidDevice → close fd → USB can suspend
                 }
@@ -824,6 +839,7 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
                         // Principle 4: treat wake as total state invalidation.
                         // Actively query AC state and screensaver — don't trust
                         // missed signals from before/during suspend.
+                        let ac_hint = LAST_AC_ONLINE.load(Ordering::Relaxed);
                         let ac_before = d
                             .get_device()
                             .map(|laptop| laptop.get_ac_state())
@@ -834,58 +850,21 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
                             .map(|laptop| laptop.get_ac_state())
                             .unwrap_or(1);
                         // UPower can briefly report AC=false right after resume even
-                        // while the charger is connected. If we immediately trust that
-                        // transient value we load the battery profile and may restore
-                        // brightness 0. Retry for ~2 s before accepting battery mode.
-                        if ac_before == 1 && ac_after == 0 {
-                            drop(d);
+                        // while the charger is connected. If the stable hint says we
+                        // were on AC, retry for ~2 s before accepting battery mode.
+                        if ac_after == 0 && ac_hint {
                             for _ in 0..10 {
                                 thread::sleep(std::time::Duration::from_millis(200));
-                                if let Ok(mut d_retry) = DEV_MANAGER.lock() {
-                                    d_retry.set_ac_state_get();
-                                    ac_after = d_retry
-                                        .get_device()
-                                        .map(|laptop| laptop.get_ac_state())
-                                        .unwrap_or(1);
-                                    if ac_after == 1 {
-                                        info!("Resume AC stabilize: switched back to AC profile after retry");
-                                        break;
-                                    }
+                                d.set_ac_state_get();
+                                ac_after = d
+                                    .get_device()
+                                    .map(|laptop| laptop.get_ac_state())
+                                    .unwrap_or(1);
+                                if ac_after == 1 {
+                                    info!("Resume AC stabilize: switched back to AC profile after retry");
+                                    break;
                                 }
                             }
-                            if let Ok(mut d_relock) = DEV_MANAGER.lock() {
-                                if discovered {
-                                    // Always restore KB on wake — user needs visible keys
-                                    // at the lock screen to type their password.
-                                    // The screensaver ActiveChanged(true) signal will blank
-                                    // it again if a real idle screensaver kicks in.
-                                    d_relock.screensaver_active = false;
-                                    d_relock.restore_light();
-                                    info!(
-                                        "Resume: KB restored (screensaver_active was {}, ac_before={}, ac_after={})",
-                                        ss_active,
-                                        ac_before,
-                                        ac_after
-                                    );
-                                }
-                            }
-                            SYSTEM_STATE.store(sys_state::AWAKE, Ordering::SeqCst);
-                            info!("System AWAKE at {}ms after resume", resume_start.elapsed().as_millis());
-                            if discovered {
-                                thread::spawn(|| {
-                                    thread::sleep(std::time::Duration::from_millis(2000));
-                                    if SYSTEM_STATE.load(Ordering::Relaxed) != sys_state::AWAKE {
-                                        return; // another sleep happened, abort
-                                    }
-                                    if let Ok(mut d) = DEV_MANAGER.lock() {
-                                        if !d.screensaver_active {
-                                            info!("Resume brightness retry: re-applying KB backlight");
-                                            d.restore_light();
-                                        }
-                                    }
-                                });
-                            }
-                            return;
                         }
                         if discovered {
                             // Always restore KB on wake — user needs visible keys
@@ -893,10 +872,28 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
                             // The screensaver ActiveChanged(true) signal will blank
                             // it again if a real idle screensaver kicks in.
                             d.screensaver_active = false;
+                            let profile_brightness = d
+                                .get_ac_config(ac_after)
+                                .map(|cfg| cfg.brightness)
+                                .unwrap_or(0);
+                            let pre_suspend_brightness =
+                                PRE_SUSPEND_BRIGHTNESS_RAW.load(Ordering::Relaxed);
                             d.restore_light();
+                            if profile_brightness == 0 && pre_suspend_brightness > 0 {
+                                if let Some(laptop) = d.get_device() {
+                                    laptop.set_screensaver(false);
+                                    laptop.set_brightness(pre_suspend_brightness);
+                                }
+                                info!(
+                                    "Resume brightness fallback: profile=0 for ac_after={}, using pre-suspend raw brightness {}",
+                                    ac_after,
+                                    pre_suspend_brightness
+                                );
+                            }
                             info!(
-                                "Resume: KB restored (screensaver_active was {}, ac_before={}, ac_after={})",
+                                "Resume: KB restored (screensaver_active was {}, ac_hint={}, ac_before={}, ac_after={})",
                                 ss_active,
+                                ac_hint,
                                 ac_before,
                                 ac_after
                             );

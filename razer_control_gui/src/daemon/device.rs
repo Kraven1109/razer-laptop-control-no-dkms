@@ -147,10 +147,34 @@ impl DeviceManager {
 
     pub fn light_off(&mut self) {
         self.screensaver_active = true;
-        if let Some(laptop) = self.get_device() {
-            laptop.set_screensaver(true);
-            laptop.set_brightness(0);
-            laptop.set_logo_led_state(0);
+        // Suspend can race with HID re-enumeration. If the current handle is stale,
+        // the blanking write may fail and the keyboard appears to stay lit in sleep.
+        // Retry once after forced re-discovery before giving up.
+        let mut blanked = false;
+        for attempt in 0..2 {
+            if self.device.is_none() {
+                self.discover_devices();
+            }
+            let write_ok = if let Some(laptop) = self.get_device() {
+                laptop.set_screensaver(true);
+                let kb_ok = laptop.set_brightness(0);
+                let _ = laptop.set_logo_led_state(0);
+                kb_ok
+            } else {
+                false
+            };
+            if write_ok {
+                blanked = true;
+                break;
+            }
+            warn!(
+                "light_off: failed to write suspend blank on attempt {}, retrying with re-discovery",
+                attempt + 1
+            );
+            self.device = None;
+        }
+        if !blanked {
+            warn!("light_off: could not blank keyboard before suspend");
         }
     }
 
