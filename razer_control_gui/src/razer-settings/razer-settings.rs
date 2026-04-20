@@ -3,6 +3,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -563,7 +565,7 @@ fn build_power_page(ac: bool, device: &SupportedDevice) -> gtk::ScrolledWindow {
         if ac {
             let sync_enabled = get_sync().unwrap_or(false);
             let sync_row = adw::SwitchRow::builder()
-                .title("Sync AC & Battery Profiles")
+                .title("Sync AC and Battery Profiles")
                 .subtitle("Mirror power profile and brightness settings to both power states")
                 .active(sync_enabled)
                 .build();
@@ -1446,6 +1448,7 @@ fn build_system_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
     let (ram_used_init, ram_total_init) = read_ram_mb();
     let cpu_temp_init                   = read_cpu_temp_c();
     let nvme_temp_init                  = read_nvme_temp_c();
+    let fan_rpm_init                    = get_fan_tachometer();
 
     // ── Status + metric tiles ──────────────────────────────────────────
     let monitors_group = adw::PreferencesGroup::builder()
@@ -1545,11 +1548,18 @@ fn build_system_page(device: &SupportedDevice) -> gtk::ScrolledWindow {
     let (nvme_temp_tile, nvme_temp_lbl, _)           = make_stat_tile(
         "SSD Temp", &nvme_temp_init.map_or("--".into(), |t| format!("{}°C", t)),
         "NVMe sensor", "metric-cyan");
+    let (fan_rpm_tile, fan_rpm_lbl, fan_rpm_sub)     = make_stat_tile(
+        "Fan", &fan_rpm_init.map_or("--".into(), |rpm| format!("{} RPM", rpm.max(0))),
+        "EC tachometer", "metric-cyan");
+    if fan_rpm_init.unwrap_or(0) <= 0 {
+        fan_rpm_sub.set_text("Unavailable");
+    }
 
     sys_grid.attach(&cpu_util_tile,  0, 0, 1, 1);
     sys_grid.attach(&cpu_ram_tile,   1, 0, 1, 1);
     sys_grid.attach(&cpu_temp_tile,  0, 1, 1, 1);
     sys_grid.attach(&nvme_temp_tile, 1, 1, 1, 1);
+    sys_grid.attach(&fan_rpm_tile,   0, 2, 2, 1);
     sys_panel.append(&sys_grid);
 
     panels_box.append(&gpu_panel);
@@ -2050,6 +2060,7 @@ for (var i = 0; i < wins.length; i++) {
             let cpu_ram_s    = cpu_ram_sub.clone();
             let cpu_temp_l   = cpu_temp_lbl.clone();
             let nvme_temp_l  = nvme_temp_lbl.clone();
+            let fan_rpm_l    = fan_rpm_lbl.clone();
             let cpu_prev_t   = cpu_prev.clone();
             glib::timeout_add_seconds_local(3, move || {
                 // 1. Consume any fresh data produced by the previous background thread.
@@ -2108,6 +2119,13 @@ for (var i = 0; i < wins.length; i++) {
                     }
                     if let Some(t) = read_nvme_temp_c() {
                         nvme_temp_l.set_text(&format!("{}°C", t));
+                    }
+                    if let Some(rpm) = get_fan_tachometer() {
+                        if rpm > 0 {
+                            fan_rpm_l.set_text(&format!("{} RPM", rpm));
+                        } else {
+                            fan_rpm_l.set_text("--");
+                        }
                     }
                     // CPU utilization: delta between two successive /proc/stat samples.
                     {
@@ -2339,13 +2357,13 @@ for (var i = 0; i < wins.length; i++) {
 
         let startup_row = adw::SwitchRow::builder()
             .title("Start Tray App on Login")
-            .subtitle("Launch razer-settings minimized to the system tray at session start")
+            .subtitle("Launch razer-settings automatically at session start")
             .active(autostart_enabled)
             .build();
 
         let minimized_row = adw::SwitchRow::builder()
-            .title("Start Minimized to Tray")
-            .subtitle("Keep the main window hidden until the tray icon opens it")
+            .title("Start to System Tray Only")
+            .subtitle("Keep the window hidden on login; tray icon and app process still run")
             .active(saved_gui.start_minimized)
             .build();
 
@@ -2409,14 +2427,55 @@ for (var i = 0; i < wins.length; i++) {
 
 // ── Entry point ───────────────────────────────────────────────────────────
 
+struct InstanceGuard {
+    _listener: UnixListener,
+    socket_path: PathBuf,
+}
+
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+fn acquire_instance_guard() -> Option<InstanceGuard> {
+    let socket_path = std::env::temp_dir().join("razer-settings-singleton.sock");
+    if socket_path.exists() {
+        // If another process answers on this socket, an instance is already running.
+        if UnixStream::connect(&socket_path).is_ok() {
+            return None;
+        }
+        // Stale socket file from a previous crash.
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    let listener = UnixListener::bind(&socket_path).ok()?;
+    Some(InstanceGuard {
+        _listener: listener,
+        socket_path,
+    })
+}
+
 fn main() {
     setup_panic_hook();
 
+    let _instance_guard = match acquire_instance_guard() {
+        Some(guard) => guard,
+        None => {
+            eprintln!("razer-settings is already running");
+            return;
+        }
+    };
+
     // GTK rejects unknown CLI options, so minimized autostart is passed via env.
-    let minimized = std::env::var("RAZER_SETTINGS_START_MINIMIZED")
+    let env_minimized = std::env::var("RAZER_SETTINGS_START_MINIMIZED")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    if minimized {
+    // Fallback for desktop environments that launch from autostart without
+    // propagating custom Exec environment variables.
+    let autostart_minimized = std::env::var_os("DESKTOP_AUTOSTART_ID").is_some()
+        && gui_config::GuiConfig::load().start_minimized;
+    if env_minimized || autostart_minimized {
         START_MINIMIZED.store(true, Ordering::Relaxed);
     }
 
@@ -2435,9 +2494,9 @@ fn main() {
     // Load minimal CSS overrides
     relm4::set_global_css(include_str!("style.css"));
 
-    // Force dark color scheme
+    // Let libadwaita follow the desktop color preference.
     let style_manager = adw::StyleManager::default();
-    style_manager.set_color_scheme(adw::ColorScheme::ForceDark);
+    style_manager.set_color_scheme(adw::ColorScheme::Default);
 
     // Spawn tray icon
     {
