@@ -24,6 +24,7 @@ struct NvmlEnergyBaseline {
 }
 
 static NVML_ENERGY: OnceLock<Mutex<Option<NvmlEnergyBaseline>>> = OnceLock::new();
+static NVML_INSTANCE: OnceLock<Mutex<Option<nvml_wrapper::Nvml>>> = OnceLock::new();
 
 fn find_nvidia_runtime_status_path() -> Option<PathBuf> {
     let devices = fs::read_dir("/sys/bus/pci/devices").ok()?;
@@ -136,7 +137,15 @@ pub fn query_nvidia_gpu() -> Option<GpuStatus> {
 }
 
 fn query_nvml() -> Option<GpuStatus> {
-    let nvml = nvml_wrapper::Nvml::init().ok()?;
+    // Reuse a single NVML context for the daemon lifetime.
+    // Re-initializing NVML every poll leaks kernel/event fds on some drivers,
+    // eventually hitting EMFILE and breaking HID access.
+    let state = NVML_INSTANCE.get_or_init(|| Mutex::new(None));
+    let mut nvml_guard = state.lock().ok()?;
+    if nvml_guard.is_none() {
+        *nvml_guard = nvml_wrapper::Nvml::init().ok();
+    }
+    let nvml = nvml_guard.as_ref()?;
     let device = nvml.device_by_index(0).ok()?;
 
     let name = device.name().ok()?;

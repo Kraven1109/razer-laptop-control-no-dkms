@@ -473,7 +473,13 @@ impl DeviceManager {
     }
 
     pub fn set_ac_state_get(&mut self) {
-        let dbus_system = Connection::new_system().expect("failed to connect to D-Bus system bus");
+        let dbus_system = match Connection::new_system() {
+            Ok(conn) => conn,
+            Err(error) => {
+                warn!("set_ac_state_get: failed to connect to system D-Bus: {}", error);
+                return;
+            }
+        };
         let proxy_ac = dbus_system.with_proxy(
             "org.freedesktop.UPower",
             "/org/freedesktop/UPower/devices/line_power_AC0",
@@ -594,9 +600,30 @@ impl DeviceManager {
 
     pub fn find_supported_device(&mut self, vid: u16, pid: u16) -> Option<&SupportedDevice> {
         for device in &self.supported_devices {
-            // Unwrap: we control the strings and know they are are valid
-            let svid = u16::from_str_radix(&device.vid, 16).unwrap();
-            let spid = u16::from_str_radix(&device.pid, 16).unwrap();
+            let svid = match u16::from_str_radix(&device.vid, 16) {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(
+                        "Skipping malformed supported-device VID '{}' ({}): {}",
+                        device.vid,
+                        device.name,
+                        error
+                    );
+                    continue;
+                }
+            };
+            let spid = match u16::from_str_radix(&device.pid, 16) {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(
+                        "Skipping malformed supported-device PID '{}' ({}): {}",
+                        device.pid,
+                        device.name,
+                        error
+                    );
+                    continue;
+                }
+            };
 
             if svid == vid && spid == pid {
                 return Some(device);

@@ -62,6 +62,77 @@ fn get_device_name() -> Option<String> {
     }
 }
 
+fn scrub_deprecated_gtk_dark_pref_setting() {
+    let home = match std::env::var("HOME") {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let settings_path = std::path::Path::new(&home).join(".config/gtk-4.0/settings.ini");
+
+    let content = match std::fs::read_to_string(&settings_path) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+
+    let mut removed = false;
+    let filtered_lines: Vec<&str> = content
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            let deprecated = trimmed.starts_with("gtk-application-prefer-dark-theme=");
+            if deprecated {
+                removed = true;
+            }
+            !deprecated
+        })
+        .collect();
+
+    if !removed {
+        return;
+    }
+
+    let mut updated = filtered_lines.join("\n");
+    if content.ends_with('\n') {
+        updated.push('\n');
+    }
+
+    match std::fs::write(&settings_path, updated) {
+        Ok(_) => eprintln!(
+            "Removed deprecated GTK setting from {} to avoid libadwaita warning",
+            settings_path.display()
+        ),
+        Err(error) => eprintln!(
+            "Failed to update {}: {}",
+            settings_path.display(),
+            error
+        ),
+    }
+}
+
+fn find_device_config_with_retry(devices: &[SupportedDevice]) -> Option<SupportedDevice> {
+    const RETRIES: u32 = 40;
+    const RETRY_DELAY_MS: u64 = 250;
+
+    for attempt in 0..RETRIES {
+        if let Some(device_name) = get_device_name() {
+            if let Some(device) = devices.iter().find(|d| d.name == device_name) {
+                if attempt > 0 {
+                    eprintln!(
+                        "Connected to daemon after {} startup retries",
+                        attempt
+                    );
+                }
+                return Some(device.clone());
+            }
+        }
+        if attempt + 1 < RETRIES {
+            std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
+        }
+    }
+
+    None
+}
+
 fn get_bho() -> Option<(bool, u8)> {
     match send_data(comms::DaemonCommand::GetBatteryHealthOptimizer())? {
         comms::DaemonResponse::GetBatteryHealthOptimizer { is_on, threshold } => {
@@ -2459,6 +2530,10 @@ fn acquire_instance_guard() -> Option<InstanceGuard> {
 fn main() {
     setup_panic_hook();
 
+    // If this deprecated key is present in the user's GTK4 settings, libadwaita
+    // prints a warning on every launch. Remove it once at startup.
+    scrub_deprecated_gtk_dark_pref_setting();
+
     let _instance_guard = match acquire_instance_guard() {
         Some(guard) => guard,
         None => {
@@ -2483,11 +2558,7 @@ fn main() {
         std::fs::read_to_string(service::DEVICE_FILE).or_crash("Failed to read the device file");
     let devices: Vec<SupportedDevice> =
         serde_json::from_str(&device_file).or_crash("Failed to parse the device file");
-    let device_name = get_device_name().or_crash("Failed to get device name");
-    let device = devices
-        .into_iter()
-        .find(|d| d.name == device_name)
-        .or_crash("Failed to find device config");
+    let device = find_device_config_with_retry(&devices).or_crash("Failed to find device config");
 
     let app = RelmApp::new("io.github.razer-linux.razer-blade-control");
 
